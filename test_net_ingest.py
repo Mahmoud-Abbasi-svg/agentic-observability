@@ -147,6 +147,33 @@ def main() -> int:
     ok &= check("--no-shift keeps the original capture times",
                 abs(oldest - BASE) < 120, f"{oldest} vs {BASE}")
 
+    # --- sub-second polling must survive the store ------------------------------------------
+    # The primary key is (target, metric, ts). While ts was truncated to whole seconds, every
+    # measurement taken inside the same second overwrote the one before it - silently, since
+    # INSERT OR REPLACE reports success either way. Found on the first real capture: six RTUs
+    # polled in bursts of three transactions within one second, every ten seconds, arrived in
+    # the table with exactly two thirds missing, and a noise floor was computed on what was
+    # left with nothing indicating anything had gone.
+    burst = []
+    for cycle in range(30):                       # 3 transactions ~10 ms apart, every 10 s
+        for k in range(3):
+            burst.append((cycle * 3 + k + 1, cycle * 10.0 + k * 0.010, 0.0008 + k * 0.0001))
+    build(burst)
+    rb = net_ingest.ingest(PCAP, os.path.join(WORK, "burst.db"))
+    cb = net_store.connect(os.path.join(WORK, "burst.db"))
+    n_stored = list(cb.execute("SELECT COUNT(*) FROM sample WHERE metric='response_ms'"))[0][0]
+    ok &= check("three polls inside one second are three samples, not one",
+                n_stored == 90, f"{n_stored} stored of 90 transactions")
+    ok &= check("the ingester reports what was STORED, not what it handed over",
+                rb["written"] == n_stored and rb["lost"] == 0,
+                f"written={rb['written']}, lost={rb['lost']}")
+
+    ts = [r[0] for r in cb.execute(
+        "SELECT ts FROM sample WHERE metric='response_ms' ORDER BY ts")]
+    ok &= check("sub-second spacing is preserved in the store",
+                any(0 < (b - a) < 0.5 for a, b in zip(ts, ts[1:])),
+                f"smallest gap {min(b - a for a, b in zip(ts, ts[1:])):.4f}s")
+
     print("\n" + ("ALL PASS" if ok else "FAILURES ABOVE"))
     return 0 if ok else 1
 

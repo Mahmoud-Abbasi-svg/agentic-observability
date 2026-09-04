@@ -410,6 +410,36 @@ which is why it is not the default.
 2-hour default comparison window; it yields one placebo window and the honest answer is
 `UNKNOWN`. Pass `--recent-hours 0.05` or similar and it calibrates properly.
 
+### On a real capture
+
+[Lemay's CSET'16 Modbus dataset](https://github.com/antoine-lemay/Modbus_dataset), 6-RTU
+polling, 58,325 packets over 59 minutes, captured February 2015. Every request paired to its
+response — 1071 transactions per RTU, six RTUs, none unmatched.
+
+```
+192.168.1.101:1   1071 samples over 1.0 h, median 0.78 ms
+  instrument floor : steps of 0.000238 ms on a median of 0.78  ->  0.0%
+  statistical floor: 10% at 80% power (967 placebo windows of 105, noise floor 8.6%)
+  BINDING LIMIT    : STATISTICS, at 10.0%
+
+  a 5% change  -> NO.  "no change" here would mean invisible, not absent
+  a 20% change -> YES. "no change" here is real evidence of no change
+```
+
+Worth noting which way round that is. On the laptop, `ping` reports whole milliseconds and the
+**instrument** binds. On a capture the clock is microsecond-resolution, so the instrument floor
+is effectively zero and the **path's own variance** binds instead. Passive observation gives
+better resolution than active probing, not worse.
+
+**The first real capture also exposed a silent data loss in the store.** The sample table's
+primary key is `(target, metric, ts)` and `ts` was truncated to whole seconds, so measurements
+taken within the same second overwrote one another — `INSERT OR REPLACE` reporting success
+every time. These RTUs are polled in bursts of three transactions inside one second, every ten
+seconds, so exactly two thirds of the data vanished on the way in, and a noise floor was then
+computed confidently on the third that survived. The live collector polls at 60 s and had never
+met it. Timestamps now keep microsecond precision, and the ingester counts what is *in the
+table* rather than what it handed over, warning if the two differ.
+
 `--bin S` aggregates to one median per S seconds for very dense captures. It also destroys the
 instrument quantum, so the reported step afterwards describes the binning rather than the
 capture.

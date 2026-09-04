@@ -161,17 +161,34 @@ def ingest(path: str, db: str, label: str = "", shift: bool = True,
                 subnet=f"capture of {os.path.basename(path)}")
     net_store.remember_net(conn, info)
 
-    written = 0
+    offered = 0
     for target, rows in sorted(per_server.items()):
         rows = sorted(rows)
         if bin_s > 0:
             rows = _bin_rows(rows, bin_s)
         for ts, v in rows:
-            written += net_store.add_samples(conn, target, {"response_ms": v},
-                                             net_id, ts=int(ts + offset))
+            offered += net_store.add_samples(conn, target, {"response_ms": v},
+                                             net_id, ts=ts + offset)
     conn.commit()
 
+    # Count what is actually in the table, not what was handed to it. add_samples returns the
+    # number of rows it was given, and the primary key is (target, metric, ts) with INSERT OR
+    # REPLACE - so two measurements sharing a timestamp collapse into one and report success.
+    # On the first real capture that silently discarded two thirds of the data, and a noise
+    # floor was then computed on the remainder with no indication anything was missing.
+    stored = {t: c for t, c in conn.execute(
+        "SELECT target, COUNT(*) FROM sample WHERE net_id=? AND metric='response_ms' "
+        "GROUP BY target", (net_id,))}
+    written = sum(stored.values())
+    lost = offered - written
+    if lost > 0 and bin_s <= 0:
+        print(f"\n  WARNING: {lost} of {offered} samples ({100.0 * lost / offered:.0f}%) "
+              f"collided on timestamp and were overwritten.\n"
+              f"  Two measurements of the same target cannot share a time. Every statistic "
+              f"below is computed on what survived.", file=sys.stderr)
+
     return dict(db=db, net_id=net_id, label=info["label"], transactions=n, written=written,
+                offered=offered, lost=lost, stored=stored,
                 targets={t: len(r) for t, r in sorted(per_server.items())},
                 exceptions=dict(exceptions), first=first, last=last,
                 span_h=(last - first) / 3600.0, shifted=shift)

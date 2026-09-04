@@ -278,7 +278,20 @@ def remember_net(conn: sqlite3.Connection, info: dict) -> None:
 
 def add_samples(conn: sqlite3.Connection, target: str, metrics: dict[str, float],
                 net_id: str, ts: Optional[int] = None) -> int:
-    ts = int(ts if ts is not None else time.time())
+    # Sub-second precision is kept, and that is not cosmetic. The primary key is
+    # (target, metric, ts), so truncating to whole seconds makes every measurement taken
+    # within the same second overwrite the previous one - silently, because INSERT OR REPLACE
+    # reports success either way.
+    #
+    # The live collector polls at 60 s and never met this. A real industrial capture did
+    # immediately: six RTUs polled in bursts of three transactions inside one second, every
+    # ten seconds, lost exactly two thirds of their data on the way into the table. Nothing
+    # reported a problem, and a noise floor was then computed confidently on the third that
+    # survived - which is precisely the failure this project exists to make impossible.
+    #
+    # Rounded to microseconds: finer than any capture clock, and it keeps the key exact rather
+    # than at the mercy of float representation.
+    ts = round(float(ts if ts is not None else time.time()), 6)
     rows = [(ts, target, k, float(v), net_id) for k, v in metrics.items()]
     conn.executemany("INSERT OR REPLACE INTO sample (ts,target,metric,value,net_id) "
                      "VALUES (?,?,?,?,?)", rows)
