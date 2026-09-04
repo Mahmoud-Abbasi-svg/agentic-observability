@@ -97,8 +97,14 @@ def main() -> int:
     pct = 100.0 * blind / len(answers)
     print(f"\nanswers carrying numbers where NOTHING matched: {blind}/{len(answers)} "
           f"({pct:.0f}%)")
-    print("  ^ the failure mode that matters. Each of these got a report implying it was "
-          "checked.")
+    print("  This is NOT automatically a miss. An answer to 'why is port 9999 refusing'")
+    print("  contains readings and no claims of change, so nothing SHOULD match. The number")
+    print("  is only evidence of blindness on answers that were asked a change question -")
+    print("  read the phrases below and judge, rather than reading this figure as a score.")
+    print(f"\n  {tot_numbers - tot_claims} numeric phrase(s) were left unflagged. Every one")
+    print("  that is genuinely a reading is a false positive AVOIDED - which is the failure")
+    print("  this module cannot afford, since warnings that fire on correct output get")
+    print("  ignored and then the real ones are ignored too.")
 
     if disagreements:
         print(f"\n{len(disagreements)} claim(s) the verifier calls unsupportable inside answers "
