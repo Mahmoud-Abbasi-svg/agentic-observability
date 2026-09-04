@@ -202,6 +202,31 @@ _CACHE: dict = {"at": 0.0, "info": None}
 _CACHE_TTL = 30.0
 
 
+# A replayed capture is not this laptop's network, and must never borrow its identity -
+# baselines are per-network precisely so that one path's normal is never compared against
+# another's. When NET_REPLAY_ID names a net_id already recorded in the database, the identity
+# is read from that row instead of probed from the machine, so every analysis tool operates on
+# the capture without a single change to its code.
+REPLAY_ENV = "NET_REPLAY_ID"
+
+
+def _identity_from_db(net_id: str) -> dict:
+    # DB_PATH is read from the environment once, when this module is imported. Anything that
+    # sets NET_MONITOR_DB afterwards - a test, or a caller switching databases mid-process -
+    # would be silently ignored if that frozen value were used here, and the lookup would fail
+    # against the wrong file while reporting the right net_id.
+    path = os.environ.get("NET_MONITOR_DB", DB_PATH)
+    row = connect(path).execute(
+        "SELECT net_id,label,gateway,gw_mac,ssid,subnet FROM net WHERE net_id=?",
+        (net_id,)).fetchone()
+    if not row:
+        raise SystemExit(
+            f"{REPLAY_ENV}={net_id} but no such network is recorded in {path}.\n"
+            f"Ingest a capture first, or unset {REPLAY_ENV} to use the live network.")
+    return dict(net_id=row[0], label=row[1], gateway=row[2], gw_mac=row[3],
+                ssid=row[4], subnet=row[5], strength="replay")
+
+
 def network_identity(force: bool = False) -> dict:
     """Identify the network this machine is currently on.
 
@@ -209,6 +234,10 @@ def network_identity(force: bool = False) -> dict:
     `arp` each time would cost more than the measurements do. 30 s is short enough that a
     move is noticed almost immediately.
     """
+    replay = os.environ.get(REPLAY_ENV, "").strip()
+    if replay:
+        return _identity_from_db(replay)
+
     now = time.time()
     if not force and _CACHE["info"] and (now - _CACHE["at"]) < _CACHE_TTL:
         return _CACHE["info"]

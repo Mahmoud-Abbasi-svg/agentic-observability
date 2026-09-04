@@ -58,6 +58,7 @@ diagnosis without a retry.
 | `net_verify.py` | checks the agent's claims of change against each path's noise floor, in code rather than by prompt |
 | `net_agent.py` | the agent: system prompt, tool wiring, CLI |
 | `net_collect.py` | the collector — measures on a schedule, no model call, ever |
+| `net_ingest.py` | passive alternative: reads Modbus/TCP response times out of a pcap, for networks you must not probe |
 | `net_alert.py` | the evaluator, alert state machine and notifier |
 | `net_eval.py` | scores the agent on scenarios with known answers — `python net_eval.py [-r 3]` |
 | `test_detect_change.py` | validates the change-detection statistics against injected shifts |
@@ -65,6 +66,8 @@ diagnosis without a retry.
 | `test_can_detect.py` | validates that the *reason* a change is unresolvable is named correctly |
 | `test_net_size.py` | validates that the sizer never slows an availability check on resolution grounds |
 | `test_net_verify.py` | validates that unsupportable claims are caught *and* that plain readings are not |
+| `test_net_ingest.py` | validates pcap parsing against a capture whose response times are known by construction |
+| `test_net_eval.py` | validates that the eval's deterministic scoring does not fire on correct answers |
 | `net_monitor.db` | the store (created on first run; override with `NET_MONITOR_DB`) |
 | `monitor.json` | which targets to collect, how often, optional webhook |
 
@@ -352,6 +355,64 @@ answer is known by construction. `python test_net_alert.py` — 13 checks:
 The two middle rows are the design from both ends: a shift big enough to matter that the path
 cannot resolve, and a shift the path resolves easily that is too small to matter. A monitor
 needs both tests and almost none have either.
+
+## Working from a capture instead of probing
+
+`net_collect.py` measures by sending traffic. On an industrial or otherwise sensitive network
+that is often forbidden and sometimes unsafe — a control loop with a cyclic budget does not
+want extra packets in it, and ICMP is frequently disabled on the switches anyway. Industrial
+monitoring is passive: a SPAN port, a TAP, or a stored capture.
+
+```
+python net_ingest.py clean.pcap --db ics.db
+```
+
+Modbus/TCP carries a transaction identifier in its MBAP header and the server echoes it, so
+pairing request to response gives a genuine response time per transaction. Nothing downstream
+changes: `net_memory`, `net_alert`, `net_size` and `net_verify` only ever see
+`(ts, target, metric, value)` and do not care whether a number came from a probe this machine
+sent or from a conversation it merely watched.
+
+On a two-server capture it separates the causes correctly:
+
+```
+10.0.0.90:1  steps of 0.0999 on a median of 4     BINDING LIMIT: INSTRUMENT at 2.5%
+             -> a finer instrument; more samples will not help
+10.0.0.91:1  noise floor 4.1%, median 12.1        BINDING LIMIT: STATISTICS at 10.0%
+             -> widen the window: 636 samples instead of 159
+```
+
+The `0.0999` step is the **capture clock's own resolution**, read off the data by `_quantum`.
+That is the reason to use a real capture rather than a simulator: a simulated noise floor is
+whatever you programmed it to be, so measuring it measures your random number generator.
+
+**Two things it does deliberately, and states rather than hides.**
+
+*It writes under the capture's own network identity, never the live one.* Baselines are
+per-network so one path's normal is never compared against another's, and a factory capture
+must not contaminate the baseline for your office Wi-Fi. Set `NET_REPLAY_ID` to that identity
+and every tool adopts it:
+
+```
+set NET_MONITOR_DB=ics.db
+set NET_REPLAY_ID=fb435ebecc3e
+python net_size.py --goal 5
+```
+
+*It shifts the timestamps so the capture ends "now".* Every analysis function asks for the
+last N days against the current clock, so a 2016 capture would otherwise be silently invisible
+to all of them. Only the epoch offset moves — intervals, gaps and ordering are preserved
+exactly — and the capture date goes into the network label so a replay can never be mistaken
+for live measurement. `--no-shift` keeps the real times, and then the tools find nothing,
+which is why it is not the default.
+
+**Captures need shorter windows than live monitoring.** A 30-minute capture cannot fill the
+2-hour default comparison window; it yields one placebo window and the honest answer is
+`UNKNOWN`. Pass `--recent-hours 0.05` or similar and it calibrates properly.
+
+`--bin S` aggregates to one median per S seconds for very dense captures. It also destroys the
+instrument quantum, so the reported step afterwards describes the binning rather than the
+capture.
 
 ## Self-sizing: setting the sampling rate from the resolution you need
 
