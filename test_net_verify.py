@@ -213,6 +213,28 @@ def main() -> int:
     ok &= check("'noise' does not count as a negation",
                 not net_verify._is_refuted("noisy-path latency rose 4% in normal noise", "4%"))
 
+    # --- sentence boundaries in a domain full of dots --------------------------------------
+    # Splitting on a bare "." cut "median 12.0 vs baseline 12.6, a -4.8% shift against a 7.9%
+    # noise floor" down to the fragment "6, a -4". The refutation sat outside the fragment, so
+    # a claim the answer had explicitly denied was reported as unsupported. Decimals and
+    # dotted-quad addresses are everywhere in this text, so this is not an edge case.
+    real = ("For what it is worth, noisy-path itself shows no distinguishable change either: "
+            "recent median 12.0 vs baseline 12.6, a −4.8% shift against a 7.9% noise floor "
+            "(p=0.249), and this history could only resolve shifts of about 10% or larger.")
+    f = net_verify.verify(real)["findings"]
+    ok &= check("a decimal point does not end a sentence",
+                f and "noise floor" in f[0].claim.context,
+                f"context: {' '.join(f[0].claim.context.split())[:70]!r}" if f else "no claim")
+    ok &= check("a claim the sentence itself refutes is AGREED, not flagged",
+                f and f[0].verdict == "AGREED",
+                f"{[x.verdict for x in f]}")
+
+    f = net_verify.find_claims("Latency to 1.1.1.1 is down 4% vs baseline — not "
+                               "distinguishable from noise (p=0.31).")
+    ok &= check("a dotted-quad address does not end a sentence",
+                f and "distinguishable" in f[0].context,
+                f"context: {' '.join(f[0].context.split())[:70]!r}" if f else "no claim")
+
     # --- the report itself ---------------------------------------------------------------
     text = "Latency to noisy-path rose 4%."
     report = net_verify.format_report(net_verify.verify(text))

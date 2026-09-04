@@ -162,6 +162,10 @@ def _metric_for(text: str, pos: int) -> str:
 # character offsets - and therefore host attribution - stay correct.
 _DASHES = {0x2212: "-", 0x2013: "-", 0x2014: "-", 0x2010: "-", 0x2011: "-"}
 
+# A sentence ends only where punctuation is followed by space or end of text. "12.6" and
+# "1.1.1.1" must not be treated as three sentences each.
+_SENT_END = re.compile(r"[.!?](?=\s|$)")
+
 # Two numbers and a transition between them. This is how a model usually states a change it
 # actually measured ("median 2.00 -> 1.60 ms"), and it carries the magnitude implicitly, so
 # no baseline lookup is needed: the shift is (b - a) / a.
@@ -191,9 +195,25 @@ def find_claims(text: str, targets: Optional[list[str]] = None) -> list[Claim]:
         seen.add(pos)
         # The sentence around the claim, which is what distinguishes asserting a magnitude
         # from denying one.
-        lo = max(text.rfind(".", 0, pos), text.rfind("\n", 0, pos)) + 1
-        hi = min((i for i in (text.find(".", pos), text.find("\n", pos)) if i > 0),
-                 default=len(text))
+        #
+        # Splitting on a bare "." is wrong in this domain and was measurably wrong: network
+        # text is full of decimals and dotted-quad addresses, so "median 12.0 vs baseline
+        # 12.6, a -4.8% shift against a 7.9% noise floor" was cut down to the fragment
+        # "6, a -4". The refutation was outside the fragment, so a claim the answer had
+        # explicitly denied got flagged as unsupported. A sentence ends at ".!?" only when
+        # whitespace or the end of the text follows.
+        lo, hi = 0, len(text)
+        for m in _SENT_END.finditer(text, 0, pos):
+            lo = m.end()
+        m = _SENT_END.search(text, pos)
+        if m:
+            hi = m.start()
+        nl = text.rfind("\n", 0, pos)
+        if nl + 1 > lo:
+            lo = nl + 1
+        nl = text.find("\n", pos)
+        if 0 <= nl < hi:
+            hi = nl
         out.append(Claim(raw=raw.strip(), pos=pos,
                          target=_attribute(text, pos, targets),
                          metric=_metric_for(text, pos),
@@ -248,6 +268,10 @@ def count_numbers(text: str) -> int:
 # and both were reported as claims the answer could not support.
 _LIMIT_WORDS = re.compile(
     r"undetectab|invisibl|unresolvab|indistinguishab|too small|no better than|noise floor|"
+    # Phrasings the agent actually used, added after they were missed on real answers:
+    # "shows no distinguishable change", "not distinguishable from noise", "within noise".
+    r"n[o']?t? distinguishab|no distinguishable|within (?:the )?noise|not significant|"
+    r"only resolve|could not resolve|"
     r"below (?:the |its |that )?(?:floor|noise|threshold|resolution)|cannot (?:be )?"
     r"(?:seen|resolved|detected|distinguished)|would (?:not|n't) (?:be )?"
     r"(?:seen|detectable|visible|resolvable)|not (?:be )?(?:detectable|resolvable|measurable)|"

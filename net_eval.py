@@ -201,6 +201,27 @@ Grade it. Reply with one JSON object and nothing else:
 """
 
 
+# A forbidden phrase inside a hypothetical is not a claim. Measured, not supposed: on
+# `false_change` the agent correctly refused the premise and then wrote "If your latency
+# doubled at, say, 08:00 and recovered before 09:18, it would be entirely invisible to me" -
+# which the `latency doubled` pattern matched, scoring a forbidden claim against an answer the
+# judge rated correct. The deterministic half of the scoring is supposed to be the half that
+# cannot be argued with, so it must not fire on sentences that assert nothing.
+_HYPOTHETICAL = re.compile(r"\b(?:if|had|were|would|suppose|imagine|whether|in case|"
+                           r"hypothetical|even if|unless)\b", re.I)
+
+
+def forbidden_hits(patterns: list[str], answer: str) -> list[str]:
+    hits = []
+    for p in patterns:
+        for m in re.finditer(p, answer, re.I):
+            if _HYPOTHETICAL.search(answer[max(0, m.start() - 80):m.start()]):
+                continue
+            hits.append(p)
+            break
+    return hits
+
+
 def judge(question: str, expect: str, answer: str) -> dict:
     prompt = JUDGE_TEMPLATE.format(question=question, expect=expect, answer=answer)
     try:
@@ -219,7 +240,7 @@ def run_one(scn: dict, rep: int) -> dict:
     except Exception as e:
         return dict(id=scn["id"], rep=rep, error=f"{type(e).__name__}: {e}", secs=0)
     tools = [t[0] for t in trace]
-    forbidden = [p for p in scn["must_not"] if re.search(p, answer, re.I)]
+    forbidden = forbidden_hits(scn["must_not"], answer)
     g = judge(scn["question"], scn["expect"], answer)
     return dict(id=scn["id"], rep=rep, category=scn["category"], secs=round(time.time() - t0),
                 tools=tools, n_tools=len(tools), used_wanted=bool(set(tools) & scn["want_tools"]),
