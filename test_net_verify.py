@@ -144,6 +144,50 @@ def main() -> int:
                 v["findings"] and v["findings"][0].verdict in ("NO FLOOR", "UNSUPPORTABLE"),
                 f"{v['findings'][0].verdict}" if v["findings"] else "no claim found")
 
+    # --- what the first real answer exposed ------------------------------------------------
+    # Models write typographic characters. The first live answer contained a U+2212 minus and
+    # U+2192 arrows; nothing matched, and the report announced "no claims found" over an answer
+    # full of them - the miss case, in production, on day one.
+    v = net_verify.verify("Latency to noisy-path fell −15% overnight.")
+    ok &= check("a Unicode minus sign is read as a signed percentage",
+                v["n_claims"] == 1, f"{v['n_claims']} claim(s)")
+
+    # 40.0 -> 38.0 is 5%, under noisy-path's 20% floor. An earlier version of this case used
+    # 40.0 -> 30.0 and expected UNSUPPORTABLE, but that is a 25% change and SUPPORTED was the
+    # right answer - the fixture was wrong, not the module.
+    v = net_verify.verify("noisy-path median went 40.0 → 38.0 ms.")
+    ok &= check("an arrow transition is read as a claim of change",
+                v["n_claims"] == 1 and v["findings"][0].verdict == "UNSUPPORTABLE",
+                f"{[f.verdict for f in v['findings']]}")
+
+    v = net_verify.verify("quiet-path went from 20 ms to 30 ms.")
+    ok &= check("a 'from X to Y' transition is read as a claim of change",
+                v["n_claims"] == 1 and v["findings"][0].verdict == "SUPPORTED",
+                f"{[f.verdict for f in v['findings']]}")
+
+    # Clock times contain arrows in exactly the same shape and must not become claims.
+    v = net_verify.verify("noisy-path had a gap 13:27 → 16:26 (3.0 h).")
+    ok &= check("a clock-time range is NOT read as a claim of change",
+                v["n_claims"] == 0, f"{v['n_claims']} claim(s)")
+
+    # The same claim written two ways must get the same verdict, or the report is arbitrary.
+    a = net_verify.verify("quiet-path latency went 20.0 → 16.0 ms.")["findings"][0]
+    b = net_verify.verify("quiet-path latency fell −20%.")["findings"][0]
+    ok &= check("the same shift stated two ways gets the same verdict",
+                a.verdict == b.verdict, f"arrow={a.verdict}, percent={b.verdict}")
+
+    # The floor depends on the window, so one window is not grounds for "no window could".
+    mde, r, h = net_verify.best_floor("noisy-path", "rtt_avg_ms", 7.0)
+    single = net_memory.assess("noisy-path", "rtt_avg_ms", 2.0, 7.0)["mde"]
+    ok &= check("the floor used is the best across windows, not one default",
+                mde is not None and single is not None and mde <= single,
+                f"best {mde * 100:.0f}% at {h:g} h vs {single * 100:.0f}% at the 2 h default")
+
+    v = net_verify.verify("Latency to quiet-path rose 15%.")
+    ok &= check("the empty-result wording does not claim the answer was cleared",
+                "all read as measurements" not in net_verify.format_report(
+                    net_verify.verify("RTT to quiet-path is 13.8 ms.")))
+
     # --- the report itself ---------------------------------------------------------------
     text = "Latency to noisy-path rose 4%."
     report = net_verify.format_report(net_verify.verify(text))

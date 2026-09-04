@@ -78,6 +78,13 @@ DEFAULT_METRIC = "rtt_avg_ms"
 IMPLAUSIBLE_ANY_PATH = 0.01
 
 
+def _pct(x: float) -> str:
+    """Percentages small enough to round to zero must not print as '0%' - the report would be
+    arguing against a claim of nothing."""
+    v = x * 100.0
+    return f"{v:.1f}%" if v < 10 else f"{v:.0f}%"
+
+
 class Claim(NamedTuple):
     raw: str                 # the exact phrase matched, for quoting back
     pos: int                 # offset in the answer, so findings can be shown in order
@@ -148,11 +155,56 @@ def _metric_for(text: str, pos: int) -> str:
     return best
 
 
+# Models write typographic characters, not ASCII. The first real answer this module saw
+# contained "a MINUS-SIGN 20% shift" using U+2212, which `[+-]` cannot match, and the report
+# then said "no claims of change found" over an answer full of them. Mapped 1:1 so that
+# character offsets - and therefore host attribution - stay correct.
+_DASHES = {0x2212: "-", 0x2013: "-", 0x2014: "-", 0x2010: "-", 0x2011: "-"}
+
+# Two numbers and a transition between them. This is how a model usually states a change it
+# actually measured ("median 2.00 -> 1.60 ms"), and it carries the magnitude implicitly, so
+# no baseline lookup is needed: the shift is (b - a) / a.
+_PAIR_PATTERNS = [
+    # "went from 13 ms to 15 ms", "from 2.0 to 1.6"
+    r"from\s+(\d+(?:\.\d+)?)\s*(?:ms|%|percent)?\s+to\s+(\d+(?:\.\d+)?)\s*(?:ms|%|percent)?",
+    # "2.00 -> 1.60 ms". The guards keep clock times out: in "13:27 -> 16:26" the left number
+    # is preceded by a colon and the right one followed by one, so neither side can match.
+    r"(?<![\d:.])(\d+(?:\.\d+)?)\s*(?:→|->)\s*(\d+(?:\.\d+)?)(?![\d:])",
+]
+
+# "20-40%" asserts a range whose LOWER end is part of the claim, so the smaller number is what
+# gets checked. If the floor sits above it, the claim is partly indefensible and should be said.
+_RANGE_PATTERN = r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*(?:%|percent)"
+
+
 def find_claims(text: str, targets: Optional[list[str]] = None) -> list[Claim]:
     """Every assertion of change carrying a magnitude."""
     targets = known_targets() if targets is None else targets
+    text = text.translate(_DASHES)
     out: list[Claim] = []
     seen: set[int] = set()
+
+    def add(pos: int, raw: str, frac: Optional[float], shown: float, unit: str) -> None:
+        if any(abs(pos - s) < 4 for s in seen):
+            return
+        seen.add(pos)
+        out.append(Claim(raw=raw.strip(), pos=pos,
+                         target=_attribute(text, pos, targets),
+                         metric=_metric_for(text, pos),
+                         fraction=frac, unit=unit, value=shown))
+
+    # Ranges and pairs run FIRST, so that "20-40%" is read as a range rather than letting the
+    # signed-percentage pattern below strip "-40%" out of the middle of it.
+    for m in re.finditer(_RANGE_PATTERN, text, re.I):
+        lo, hi = sorted((float(m.group(1)), float(m.group(2))))
+        add(m.start(), m.group(0), lo / 100.0, lo, "%")
+
+    for pat in _PAIR_PATTERNS:
+        for m in re.finditer(pat, text, re.I):
+            a, b = float(m.group(1)), float(m.group(2))
+            if a <= 0 or a == b:
+                continue
+            add(m.start(), m.group(0), abs(b - a) / a, abs(b - a) / a * 100.0, "ratio")
 
     patterns = [
         # "rose 15%", "up by 4 %", "degraded 12%"
@@ -167,17 +219,9 @@ def find_claims(text: str, targets: Optional[list[str]] = None) -> list[Claim]:
     ]
     for pat in patterns:
         for m in re.finditer(pat, text, re.I):
-            if any(abs(m.start() - s) < 4 for s in seen):
-                continue                       # same number caught by two patterns
-            seen.add(m.start())
             value = abs(float(m.group(1)))
             unit = "ms" if m.group(2).lower().startswith("m") else "%"
-            out.append(Claim(
-                raw=m.group(0).strip(), pos=m.start(),
-                target=_attribute(text, m.start(), targets),
-                metric=_metric_for(text, m.start()),
-                fraction=value / 100.0 if unit == "%" else None,
-                unit=unit, value=value))
+            add(m.start(), m.group(0), value / 100.0 if unit == "%" else None, value, unit)
     return sorted(out, key=lambda c: c.pos)
 
 
@@ -188,12 +232,45 @@ def count_numbers(text: str) -> int:
 
 # --------------------------------------------------------------------------- verification
 
+# The floor depends on the comparison window, so checking ONE window and then saying "no
+# window could have seen this" is an overclaim - the exact move this project exists to stop.
+# It was caught on the first real answer: this module reported a 75% floor from its 2 h default
+# while the agent had correctly measured 35% over 6 h, and flagged a claim the agent could in
+# fact defend. So several windows are tried and the BEST (smallest) floor is used. Being
+# generous to the agent is deliberate: it means every surviving flag is unarguable.
+_FLOOR_WINDOWS = (1.0, 2.0, 6.0, 12.0, 24.0)
+_floor_cache: dict[tuple, tuple] = {}
+
+
+def best_floor(target: str, metric: str, baseline_days: float) -> tuple:
+    """(smallest resolvable shift, the assessment that produced it, its window in hours).
+
+    Returns (None, r, 0.0) when a floor exists nowhere - r is then the last assessment seen,
+    for its reason text."""
+    key = (target, metric, baseline_days)
+    if key in _floor_cache:
+        return _floor_cache[key]
+    best, best_r, best_h, last = None, None, 0.0, None
+    for h in _FLOOR_WINDOWS:
+        r = net_memory.assess(target, metric, h, baseline_days)
+        last = r
+        if r["status"] != "ok":
+            continue
+        m = r.get("mde")
+        if m is not None and (best is None or m < best):
+            best, best_r, best_h = m, r, h
+    out = (best, best_r if best_r is not None else last, best_h)
+    _floor_cache[key] = out
+    return out
+
+
 def verify_claim(c: Claim, recent_hours: float = 2.0, baseline_days: float = 7.0) -> Finding:
     if not c.target:
         return Finding(c, "UNKNOWN TARGET", None,
                        "no host could be attributed to this number, so no floor applies to it")
 
-    r = net_memory.assess(c.target, c.metric, recent_hours, baseline_days)
+    mde, r, window_h = best_floor(c.target, c.metric, baseline_days)
+    r = r or {"status": "insufficient"}
 
     if r["status"] != "ok":
         if c.fraction is not None and c.fraction < IMPLAUSIBLE_ANY_PATH:
@@ -215,21 +292,24 @@ def verify_claim(c: Claim, recent_hours: float = 2.0, baseline_days: float = 7.0
                            f"{c.value:g} ms as a relative shift")
         frac = c.value / base
 
-    mde = r.get("mde")
     if mde is None:
         return Finding(c, "UNSUPPORTABLE", None,
                        f"{c.target}/{c.metric} cannot resolve any shift on the tested grid "
-                       f"(up to 200%); a {frac * 100:.0f}% claim is not defensible")
+                       f"(up to 200%) at any window tried; a {_pct(frac)} claim is not "
+                       f"defensible")
 
-    if frac < mde:
+    # Tolerance, not tidiness: "2.00 -> 1.60" computes 0.19999999999999998 while the same claim
+    # written "-20%" gives exactly 0.20. Without this, one sentence gets two verdicts depending
+    # on how the author happened to phrase it, which would make the whole report untrustworthy.
+    if frac < mde - 1e-9:
         return Finding(c, "UNSUPPORTABLE", mde,
-                       f"{c.target}/{c.metric} resolves no better than {mde * 100:.0f}%; a "
-                       f"{frac * 100:.0f}% claim is below the floor and could not have been "
-                       f"seen whatever window was used")
+                       f"{c.target}/{c.metric} resolves no better than {_pct(mde)} at "
+                       f"its most favourable window ({window_h:g} h); a {_pct(frac)} "
+                       f"claim is below that floor")
 
     return Finding(c, "SUPPORTED", mde,
-                   f"{frac * 100:.0f}% is above the {mde * 100:.0f}% floor for "
-                   f"{c.target}/{c.metric}")
+                   f"{_pct(frac)} is above the {_pct(mde)} floor "
+                   f"{c.target}/{c.metric} reaches at {window_h:g} h")
 
 
 def verify(text: str, recent_hours: float = 2.0, baseline_days: float = 7.0) -> dict:
@@ -250,8 +330,13 @@ def verify(text: str, recent_hours: float = 2.0, baseline_days: float = 7.0) -> 
 
 def format_report(v: dict) -> str:
     if not v["findings"]:
-        return (f"VERIFIER: no claims of change found "
-                f"({v['n_numbers']} number(s) in the text, all read as measurements)")
+        # NOT "all read as measurements". The first real answer this ran on contained a -20%
+        # shift written with a Unicode minus sign, matched nothing, and got reported as though
+        # it had been examined and cleared. An empty result means the patterns found nothing,
+        # which is a statement about the patterns, not about the answer.
+        return (f"VERIFIER: no claims of change matched a known pattern "
+                f"({v['n_numbers']} number(s) present). Claims are found by pattern, so this "
+                f"is not evidence the answer makes none.")
 
     lines = []
     for f in v["findings"]:

@@ -446,9 +446,33 @@ correct output get ignored — which would quietly restore the failure this is m
 **Why the claim is compared to the floor and not to a recomputed shift.** The agent may be
 talking about a window this module cannot know (*"overnight"*, *"since the meeting"*).
 Recomputing a shift over some default window would manufacture disagreements that are
-artefacts of window choice. The floor is near enough window-independent, so every flag it
-raises is one the agent genuinely cannot defend: *no* comparison over this data could have
-resolved something that small.
+artefacts of window choice.
+
+**And the floor is taken across windows, not from one.** The floor *does* move with the
+comparison window, so checking a single window and concluding "no window could have seen this"
+is the same overclaim this project exists to prevent. `best_floor` tries 1, 2, 6, 12 and 24
+hours and keeps the **smallest** — the reading most favourable to the agent. Being generous is
+deliberate: it means every surviving flag is one the agent genuinely cannot defend.
+
+### What the first real answer exposed
+
+Both bugs below were found by running it on live agent output, not by the test suite, and both
+are now covered by tests.
+
+**It missed everything.** The agent wrote `a −20% shift` and `median 2.00 → 1.60 ms`; the
+verifier reported *"no claims of change found (22 numbers, all read as measurements)"*. The
+minus sign was **U+2212**, not ASCII `-`, so `[+-]` could never match it, and arrow transitions
+were not a recognised form at all. Typographic characters are now normalised, and `X → Y`,
+`from X to Y` and `20–40%` ranges are all read as claims — while `13:27 → 16:26` is not, since
+clock times take exactly the same shape.
+
+**Its wording was the real failure.** *"All read as measurements"* asserted the answer had been
+examined and cleared, when in fact nothing had matched. An empty result is a statement about
+the patterns, not about the answer, and it now says so.
+
+**It then overclaimed in the opposite direction.** With the parsing fixed, it flagged a −40%
+claim using a 75% floor from its 2 h default — while the agent had correctly measured 35% over
+6 h. Hence `best_floor`. On the same text it now flags one borderline claim instead of five.
 
 **It does not claim to read English completely.** Claims are found with regular expressions and
 some phrasings will be missed. A verifier that quietly misses claims is worse than none,
