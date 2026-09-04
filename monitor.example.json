@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Copy to monitor.json and edit. monitor.json is gitignored because it may name",
+    "internal hosts. 'auto' resolves to this machine's default gateway at run time,",
+    "so the address is never written into the file.",
+    "Intervals here are starting guesses. Run 'python net_size.py' to derive them",
+    "from the resolution you actually need, and --apply to write them back."
+  ],
+  "targets": [
+    {
+      "name": "gateway",
+      "kind": "ping",
+      "host": "auto",
+      "interval_s": 60
+    },
+    {
+      "name": "cloudflare",
+      "kind": "ping",
+      "host": "1.1.1.1",
+      "interval_s": 60
+    },
+    {
+      "name": "google-dns",
+      "kind": "ping",
+      "host": "8.8.8.8",
+      "interval_s": 60
+    },
+    {
+      "name": "cloudflare-tcp",
+      "kind": "tcp",
+      "host": "1.1.1.1",
+      "port": 443,
+      "interval_s": 300
+    },
+    {
+      "name": "dns-udp",
+      "kind": "dns",
+      "host": "1.1.1.1",
+      "interval_s": 300
+    },
+    {
+      "name": "example-http",
+      "kind": "http",
+      "host": "https://example.com",
+      "interval_s": 300
+    }
+  ],
+  "notify": {
+    "webhook": ""
+  }
+}

@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# Measurement data. NEVER commit these.
+#
+# net_monitor.db holds the `net` table, which records the gateway MAC address,
+# the wifi SSID and the subnet of every network this has run on. A router's MAC
+# is a wifi-geolocation key (WiGLE, Google, Apple all index them), so publishing
+# one pins the machine to a physical address. The logs and eval artefacts carry
+# the same identifiers in plain text.
+#
+# Anyone cloning this repo gets an empty database on first run, which is the
+# correct starting state anyway - baselines are per-network and do not transfer.
+# ---------------------------------------------------------------------------
+net_monitor.db
+net_monitor.db-shm
+net_monitor.db-wal
+*.db
+*.db-shm
+*.db-wal
+
+net_alerts.log
+net_history.jsonl
+net_eval_results*.json
+net_eval_stopping.json
+
+# Local configuration: may name internal hosts. monitor.example.json is tracked.
+monitor.json
+monitor.json.bak.*
+
+# ---------------------------------------------------------------------------
+# Third-party papers. Publisher PDFs (Elsevier, ACM, IEEE) are licensed for
+# personal use, not redistribution. REFERENCES.md lists them by DOI instead.
+# ---------------------------------------------------------------------------
+papers/
+*.pdf
+
+# Vendored browser tooling, not part of this project
+check_datat_base_tool/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
