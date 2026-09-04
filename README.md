@@ -54,6 +54,7 @@ diagnosis without a retry.
 | `net_store.py` | SQLite store, retention policy, and the network identity (`net_id`) |
 | `net_memory.py` | `baseline`, `detect_change`, `can_detect`, `coverage`, and the `assess` statistics behind them |
 | `net_precision.py` | `instrument_options` — measures the agent's own instruments to find which could resolve a given change |
+| `net_season.py` | tests each signal for a repeatable daily rhythm, and narrows the floor only where one is real |
 | `net_size.py` | sets each target's sampling interval from the resolution you need — `python net_size.py [--apply]` |
 | `net_verify.py` | checks the agent's claims of change against each path's noise floor, in code rather than by prompt |
 | `net_agent.py` | the agent: system prompt, tool wiring, CLI |
@@ -64,6 +65,7 @@ diagnosis without a retry.
 | `test_detect_change.py` | validates the change-detection statistics against injected shifts |
 | `test_net_alert.py` | validates the alerting against constructed histories |
 | `test_can_detect.py` | validates that the *reason* a change is unresolvable is named correctly |
+| `test_net_season.py` | validates that a wandering path is not mistaken for a seasonal one |
 | `test_net_size.py` | validates that the sizer never slows an availability check on resolution grounds |
 | `test_net_verify.py` | validates that unsupportable claims are caught *and* that plain readings are not |
 | `test_net_ingest.py` | validates pcap parsing against a capture whose response times are known by construction |
@@ -443,6 +445,43 @@ table* rather than what it handed over, warning if the two differ.
 `--bin S` aggregates to one median per S seconds for very dense captures. It also destroys the
 instrument quantum, so the reported step afterwards describes the binning rather than the
 capture.
+
+## Seasonality: is the noise really noise, or just the time of day?
+
+Every `can_detect` answer already ends with a confession — *"history contains no full
+day-night cycle, so both floors above may be optimistic."* Once there **is** more than a day
+of history the opposite error appears and nothing warns about it: a Tuesday-15:00 window gets
+scored against a baseline containing Sunday 03:00, so any daily swing is counted as noise and
+the floor comes out wider than the path deserves.
+
+```
+python net_season.py
+```
+
+**Measured, not assumed.** Seasonality is not switched on because monitoring tools have it.
+Each signal is tested, and a path with no repeatable rhythm pays nothing and is told so:
+
+```
+10.50.16.1  rtt_avg_ms   swing 34%  p=0.008   floor 75% -> 22% comparing like with like
+1.1.1.1     rtt_avg_ms   swing  6%  p=0.29    no repeatable daily shape; nothing changed
+```
+
+**The test is repeatability, not size.** A wandering path produces a large hourly swing with
+no rhythm at all, so size decides nothing. The history is split in half, an hourly profile
+built for each and normalised by that half's own median — so a drifting *level* cannot pose as
+*shape* — and the two are rank-correlated. A real rhythm has the same busy hours in both
+halves. The null needs no simulation: rotating one profile against the other by 1–23 hours
+enumerates every alternative alignment exactly.
+
+**A first version of this test had no power, and the reason is kept in the code.** It compared
+the hourly spread against a circularly shifted copy of the series, on the reasoning that
+rotation preserves autocorrelation while destroying alignment to the clock. It preserves more
+than that — rotating a series whose period *is* 24 h gives another series with the same 24 h
+period, moving only the phase and leaving the hourly spread untouched. The null reproduced the
+signal it was meant to remove, and a textbook sine wave scored **p = 0.68**.
+`test_net_season.py` still runs that null against a known rhythm (p = 0.85, blind to it)
+alongside the real one (p = 0.042), so the failure stays visible rather than being
+rediscovered.
 
 ## Self-sizing: setting the sampling rate from the resolution you need
 
