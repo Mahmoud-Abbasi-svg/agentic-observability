@@ -188,6 +188,31 @@ def main() -> int:
                 "all read as measurements" not in net_verify.format_report(
                     net_verify.verify("RTT to quiet-path is 13.8 ms.")))
 
+    # --- refuted claims are agreement, not contradiction -----------------------------------
+    # Found on the first change-question answer: the agent wrote "a 5% increase would be
+    # completely undetectable here", which says exactly what the floor says, and the verifier
+    # reported it as a claim the answer could not support. A warning on a correct answer is
+    # the failure that makes every later warning ignorable.
+    v = net_verify.verify("A 4% increase on noisy-path would be completely undetectable here.")
+    ok &= check("a magnitude the answer calls undetectable is AGREED, not flagged",
+                v["ok"] and v["findings"][0].verdict == "AGREED",
+                f"{[f.verdict for f in v['findings']]}")
+
+    v = net_verify.verify("This is not an all-clear on a 4% rise on noisy-path.")
+    ok &= check("a magnitude denied just before it is AGREED, not flagged",
+                v["ok"] and v["findings"][0].verdict == "AGREED",
+                f"{[f.verdict for f in v['findings']]}")
+
+    v = net_verify.verify("Latency to noisy-path rose 4% since yesterday.")
+    ok &= check("the same magnitude ASSERTED is still UNSUPPORTABLE",
+                not v["ok"] and v["findings"][0].verdict == "UNSUPPORTABLE",
+                f"{[f.verdict for f in v['findings']]}")
+
+    # "noise" contains "no". Without word boundaries the negation test matches every sentence
+    # that mentions the noise floor, and nothing is ever flagged again.
+    ok &= check("'noise' does not count as a negation",
+                not net_verify._is_refuted("noisy-path latency rose 4% in normal noise", "4%"))
+
     # --- the report itself ---------------------------------------------------------------
     text = "Latency to noisy-path rose 4%."
     report = net_verify.format_report(net_verify.verify(text))

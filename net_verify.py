@@ -93,11 +93,12 @@ class Claim(NamedTuple):
     fraction: Optional[float]   # magnitude as a fraction of baseline; None until resolved
     unit: str                   # "%" or "ms"
     value: float                # as written
+    context: str = ""           # the sentence it sits in, for telling assertion from refusal
 
 
 class Finding(NamedTuple):
     claim: Claim
-    verdict: str             # SUPPORTED | UNSUPPORTABLE | NO FLOOR | UNKNOWN TARGET
+    verdict: str             # SUPPORTED | UNSUPPORTABLE | AGREED | NO FLOOR | UNKNOWN TARGET
     floor: Optional[float]
     detail: str
 
@@ -188,10 +189,16 @@ def find_claims(text: str, targets: Optional[list[str]] = None) -> list[Claim]:
         if any(abs(pos - s) < 4 for s in seen):
             return
         seen.add(pos)
+        # The sentence around the claim, which is what distinguishes asserting a magnitude
+        # from denying one.
+        lo = max(text.rfind(".", 0, pos), text.rfind("\n", 0, pos)) + 1
+        hi = min((i for i in (text.find(".", pos), text.find("\n", pos)) if i > 0),
+                 default=len(text))
         out.append(Claim(raw=raw.strip(), pos=pos,
                          target=_attribute(text, pos, targets),
                          metric=_metric_for(text, pos),
-                         fraction=frac, unit=unit, value=shown))
+                         fraction=frac, unit=unit, value=shown,
+                         context=text[lo:hi].strip()))
 
     # Ranges and pairs run FIRST, so that "20-40%" is read as a range rather than letting the
     # signed-percentage pattern below strip "-40%" out of the middle of it.
@@ -231,6 +238,41 @@ def count_numbers(text: str) -> int:
 
 
 # --------------------------------------------------------------------------- verification
+
+# An answer that says "a 5% rise would be undetectable here" is AGREEING with the floor, not
+# claiming a 5% rise. Flagging it puts a warning on a correct answer - and warnings that fire
+# on correct output get ignored, which is how the real ones stop being read.
+#
+# Demonstrated, not hypothetical: on the first change-question answer the agent wrote "it is
+# *not* an all-clear on a 5% rise" and "a 5% increase ... would be completely undetectable",
+# and both were reported as claims the answer could not support.
+_LIMIT_WORDS = re.compile(
+    r"undetectab|invisibl|unresolvab|indistinguishab|too small|no better than|noise floor|"
+    r"below (?:the |its |that )?(?:floor|noise|threshold|resolution)|cannot (?:be )?"
+    r"(?:seen|resolved|detected|distinguished)|would (?:not|n't) (?:be )?"
+    r"(?:seen|detectable|visible|resolvable)|not (?:be )?(?:detectable|resolvable|measurable)|"
+    r"beyond (?:what|the) .{0,20}resolv", re.I)
+# Word boundaries are load-bearing: without them "no" matches inside "noise" and "normal",
+# so every sentence merely mentioning the noise floor would count as a denial and
+# nothing would ever be flagged again.
+# Word boundaries are load-bearing. "noisy-path" contains "no", "normal" contains "no", and
+# "noise" contains "no" - so without them every sentence mentioning the noise floor counts as
+# a denial and nothing is ever flagged again. That is a silent, total disabling of the module,
+# which is why it has its own test.
+_NEGATION = re.compile(r"\b(?:not|never|cannot|can't|couldn't|wouldn't|no)\b|\*not\*", re.I)
+
+
+def _is_refuted(context: str, raw: str) -> bool:
+    """Is this magnitude being denied or bounded rather than asserted?"""
+    if not context:
+        return False
+    if _LIMIT_WORDS.search(context):
+        return True
+    at = context.find(raw)
+    if at < 0:
+        return False
+    return bool(_NEGATION.search(context[max(0, at - 60):at]))
+
 
 # The floor depends on the comparison window, so checking ONE window and then saying "no
 # window could have seen this" is an overclaim - the exact move this project exists to stop.
@@ -302,6 +344,10 @@ def verify_claim(c: Claim, recent_hours: float = 2.0, baseline_days: float = 7.0
     # written "-20%" gives exactly 0.20. Without this, one sentence gets two verdicts depending
     # on how the author happened to phrase it, which would make the whole report untrustworthy.
     if frac < mde - 1e-9:
+        if _is_refuted(c.context, c.raw):
+            return Finding(c, "AGREED", mde,
+                           f"the answer already treats this as unresolvable "
+                           f"({_pct(mde)} floor); verifier and answer agree")
         return Finding(c, "UNSUPPORTABLE", mde,
                        f"{c.target}/{c.metric} resolves no better than {_pct(mde)} at "
                        f"its most favourable window ({window_h:g} h); a {_pct(frac)} "
@@ -341,7 +387,7 @@ def format_report(v: dict) -> str:
     lines = []
     for f in v["findings"]:
         mark = {"SUPPORTED": "ok", "UNSUPPORTABLE": "!!", "NO FLOOR": "??",
-                "UNKNOWN TARGET": "??"}[f.verdict]
+                "UNKNOWN TARGET": "??", "AGREED": "=="}[f.verdict]
         lines.append(f"  {mark}  {f.claim.raw!r:<28} {f.verdict:<15} {f.detail}")
 
     head = (f"VERIFIER: {v['n_claims']} claim(s) of change checked against the noise floor "
