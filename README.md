@@ -55,6 +55,7 @@ diagnosis without a retry.
 | `net_memory.py` | `baseline`, `detect_change`, `can_detect`, `coverage`, and the `assess` statistics behind them |
 | `net_precision.py` | `instrument_options` — measures the agent's own instruments to find which could resolve a given change |
 | `net_size.py` | sets each target's sampling interval from the resolution you need — `python net_size.py [--apply]` |
+| `net_verify.py` | checks the agent's claims of change against each path's noise floor, in code rather than by prompt |
 | `net_agent.py` | the agent: system prompt, tool wiring, CLI |
 | `net_collect.py` | the collector — measures on a schedule, no model call, ever |
 | `net_alert.py` | the evaluator, alert state machine and notifier |
@@ -63,6 +64,7 @@ diagnosis without a retry.
 | `test_net_alert.py` | validates the alerting against constructed histories |
 | `test_can_detect.py` | validates that the *reason* a change is unresolvable is named correctly |
 | `test_net_size.py` | validates that the sizer never slows an availability check on resolution grounds |
+| `test_net_verify.py` | validates that unsupportable claims are caught *and* that plain readings are not |
 | `net_monitor.db` | the store (created on first run; override with `NET_MONITOR_DB`) |
 | `monitor.json` | which targets to collect, how often, optional webhook |
 
@@ -405,6 +407,57 @@ cannot break what it is diagnosing.
 | `check_port` | is one specific TCP port accepting connections |
 | `http_check` | does the server actually *serve*, or just answer TCP |
 | `traceroute` | where along the path does latency appear |
+
+## Verifying the agent's own answers
+
+The system prompt asks the model never to let *"I couldn't see it"* read as *"it didn't
+happen"*. Asking is not enforcing. Nothing in a prompt prevents a fluent, specific, confident
+claim that the gateway latency rose 12% — on a path whose smallest detectable shift is 50%.
+
+So the check moved out of the prompt and into code. Every answer is re-examined against the
+same statistics the monitor alerts on, and the report is **appended, never substituted** —
+editing the model's words would hide the disagreement, and the disagreement is the point.
+
+```
+$ python net_verify.py "Latency to 10.50.16.1 rose 12% overnight, while 1.1.1.1
+                        stayed flat at 13.8 ms. The handshake to 1.1.1.1 increased by 30%."
+
+VERIFIER: 2 claim(s) of change checked against the noise floor (3 number(s) seen in total)
+  !!  'rose 12%'           UNSUPPORTABLE   10.50.16.1/rtt_avg_ms resolves no better than 50%;
+                                           a 12% claim is below the floor and could not have
+                                           been seen whatever window was used
+  !!  'increased by 30%'   UNSUPPORTABLE   1.1.1.1/handshake_avg_ms resolves no better than 50%
+  2 claim(s) BELOW the floor. The instrument could not have seen a change that small,
+  so the answer asserts more than the measurements support.
+```
+
+It runs automatically inside `net_agent.py`; `--no-verify` turns it off.
+
+**The distinction it turns on.** `13.8 ms` in that example was *not* flagged, and must not be:
+
+| | |
+|---|---|
+| `RTT to 1.1.1.1 is 13.8 ms` | a **reading**. The instrument reported it. Not checked. |
+| `RTT to 1.1.1.1 rose 4%` | an **inference** about a difference between two windows. The noise floor governs whether it could have been seen at all. Checked. |
+
+Flagging readings would put a warning on every honest answer, and warnings that fire on
+correct output get ignored — which would quietly restore the failure this is meant to prevent.
+
+**Why the claim is compared to the floor and not to a recomputed shift.** The agent may be
+talking about a window this module cannot know (*"overnight"*, *"since the meeting"*).
+Recomputing a shift over some default window would manufacture disagreements that are
+artefacts of window choice. The floor is near enough window-independent, so every flag it
+raises is one the agent genuinely cannot defend: *no* comparison over this data could have
+resolved something that small.
+
+**It does not claim to read English completely.** Claims are found with regular expressions and
+some phrasings will be missed. A verifier that quietly misses claims is worse than none,
+because it turns *unchecked* into *looks checked* — so every report prints how many numbers it
+saw against how many it could attribute, and unattributable claims are listed as
+`UNKNOWN TARGET` rather than passed. If the verifier itself throws, the answer is marked
+**UNCHECKED** instead of being returned bare.
+
+`python test_net_verify.py` — 13 checks, covering both failure directions.
 
 ## Evaluation
 

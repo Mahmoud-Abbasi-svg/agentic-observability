@@ -35,6 +35,7 @@ from typing import Optional
 import net_memory
 import net_precision
 import net_tools
+import net_verify
 
 MODEL = os.environ.get("NET_AGENT_MODEL", "claude-opus-5")
 MAX_STEPS = 12          # measurements per question before the agent must conclude
@@ -390,6 +391,8 @@ def main() -> int:
                     help="show each tool call and result")
     ap.add_argument("--backend", choices=["auto", "cli", "sdk"], default="auto",
                     help="auto uses the SDK when an API key is set, else the claude CLI")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="do not check the answer's claims against each path's noise floor")
     args = ap.parse_args()
 
     backend = args.backend
@@ -408,10 +411,26 @@ def main() -> int:
     def answer(q: str) -> str:
         if backend == "sdk":
             sdk_messages.append({"role": "user", "content": q})
-            return ask_sdk(sdk_messages, args.verbose)
-        out = ask_cli(q, transcript, args.verbose)
-        transcript.append(f"Q: {q}\nA: {out[:600]}")
-        return out
+            out = ask_sdk(sdk_messages, args.verbose)
+        else:
+            out = ask_cli(q, transcript, args.verbose)
+            transcript.append(f"Q: {q}\nA: {out[:600]}")
+        if args.no_verify:
+            return out
+        # Point 9 of SYSTEM asks the model never to let "I couldn't see it" read as "it didn't
+        # happen". Asking is not enforcing: a prompt cannot stop a confident 4% claim on a path
+        # whose floor is 20%. So every answer is re-checked against the same statistics the
+        # monitor alerts on, in code, after the model has finished talking.
+        #
+        # The report is APPENDED, never substituted. Editing the model's words would hide the
+        # disagreement, and the disagreement is the useful part.
+        try:
+            return net_verify.annotate(out, net_verify.verify(out))
+        except Exception as e:
+            # A broken verifier must not swallow the answer, but it must not pass silently
+            # either - silence would read as "checked and clean".
+            return f"{out}\n\n{'-' * 70}\nVERIFIER FAILED ({type(e).__name__}: {e}) - the " \
+                   f"claims above are UNCHECKED."
 
     if args.question:
         try:
