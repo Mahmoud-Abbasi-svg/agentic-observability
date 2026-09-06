@@ -297,7 +297,16 @@ def main() -> int:
         print("no signals to test")
         return 0
 
-    print(f"time-of-day effect on network {net['label']!r}, last {a.days:g} days\n")
+    print(f"time-of-day effect on network {net['label']!r}, last {a.days:g} days")
+    # A window wider than the raw retention is silently truncated by the store, and a daily
+    # profile built on less history than was asked for is not the profile the reader thinks
+    # they are looking at. Rolled-up hourly rows are not a substitute: their spread is smaller
+    # than the samples', so the null they calibrate would be too easy to beat.
+    if a.days > net_memory.RAW_DAYS:
+        print(f"NOTE: raw samples are kept for {net_memory.RAW_DAYS:g} days, so this covers "
+              f"{net_memory.RAW_DAYS:g}, not {a.days:g}. Hourly summaries survive longer but "
+              f"cannot calibrate a null.")
+    print()
     print(f"{'target':<21}{'metric':<17}{'swing':>9}{'p':>9}  effect on the noise floor")
     print("-" * 104)
     for t, m in sorted(pairs):

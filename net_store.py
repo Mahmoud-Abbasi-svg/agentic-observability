@@ -61,12 +61,19 @@ CREATE TABLE IF NOT EXISTS heartbeat (
     n_failed  INTEGER NOT NULL
 );
 
+-- What survives after raw samples are dropped: one row per hour per signal, kept for a year.
+--
+-- The columns are named for the statistics they actually hold. They were called
+-- median/p05/p95 while the insert below stored AVG/MIN/MAX - a name promising a robust centre
+-- and a 90% interval over data that was a mean and its two extremes. Nothing had read the
+-- table yet, so the lie had never been quoted; it would have been, the first time an answer
+-- said "the p95 last month was". Renamed while the table was still empty.
 CREATE TABLE IF NOT EXISTS sample_hourly (
     hour   INTEGER NOT NULL,
     target TEXT    NOT NULL,
     metric TEXT    NOT NULL,
     net_id TEXT    NOT NULL,
-    median REAL, p05 REAL, p95 REAL, n INTEGER,
+    mean   REAL, lo REAL, hi REAL, n INTEGER,
     PRIMARY KEY (target, metric, net_id, hour)
 );
 
@@ -115,7 +122,49 @@ def connect(path: str = DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")       # survives a hard stop mid-write
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+_HOURLY_RENAMES = (("median", "mean"), ("p05", "lo"), ("p95", "hi"))
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an older database up to the current schema, if it can be done right now.
+
+    CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so a rename has to
+    be applied explicitly or an existing database keeps the old column names for ever.
+
+    It is attempted on every connect and allowed to fail. A column rename is a schema change
+    and needs the write lock, which the collector holds most of the time; on the live database
+    the first attempt raised "database is locked" and, unguarded, that turned a background
+    housekeeping step into a crash in every tool that merely wanted to read. Migrations that
+    can fail must never be on the path of a reader, so this gives up quietly and `hourly_cols`
+    keeps the old names working until an attempt lands.
+    """
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sample_hourly)")}
+        pending = [(o, n) for o, n in _HOURLY_RENAMES if o in cols and n not in cols]
+        if not pending:
+            return
+        for old, new in pending:
+            conn.execute(f"ALTER TABLE sample_hourly RENAME COLUMN {old} TO {new}")
+        conn.commit()
+    except sqlite3.Error:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+
+
+def hourly_cols(conn: sqlite3.Connection) -> tuple[str, str, str]:
+    """The centre/low/high column names this particular database is currently using.
+
+    Resolved per query rather than assumed, because the rename above is best-effort: a
+    database that was busy when its readers started still has to answer them correctly.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sample_hourly)")}
+    return ("mean", "lo", "hi") if "mean" in cols else ("median", "p05", "p95")
 
 
 # --------------------------------------------------------------------- network identity
@@ -332,8 +381,12 @@ def aggregate_and_prune(conn: sqlite3.Connection, now: Optional[int] = None) -> 
     """
     now = int(now if now is not None else time.time())
     raw_cutoff = now - RAW_RETENTION_DAYS * 86400
-    conn.execute("""
-        INSERT OR REPLACE INTO sample_hourly (hour,target,metric,net_id,median,p05,p95,n)
+    # AVG/MIN/MAX, stored under those names. A real median and real percentiles would need the
+    # values in Python; the mean and the two extremes are what SQLite can aggregate directly,
+    # and calling them that is the difference between a summary and a misquote later.
+    c_mean, c_lo, c_hi = hourly_cols(conn)
+    conn.execute(f"""
+        INSERT OR REPLACE INTO sample_hourly (hour,target,metric,net_id,{c_mean},{c_lo},{c_hi},n)
         SELECT (ts/3600)*3600, target, metric, net_id,
                AVG(value), MIN(value), MAX(value), COUNT(*)
         FROM sample WHERE ts < ? GROUP BY (ts/3600), target, metric, net_id

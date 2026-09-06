@@ -64,7 +64,14 @@ DEFAULT_DETECT_WITHIN_S = 300.0
 
 def _series(target: str, metric: str, days: float) -> tuple[list[float], float]:
     """Values and the measured sampling interval, read from the data rather than the config -
-    the config says what was asked for, the data says what happened."""
+    the config says what was asked for, the data says what happened.
+
+    Raw samples only, and capped at the raw retention horizon on purpose: sizing an instrument
+    means asking what a floor would be at some sampling rate, and a floor calibrated on hourly
+    means would come out too narrow. It would then recommend sampling LESS often than the
+    signal actually needs.
+    """
+    days = min(days, net_memory.RAW_DAYS)
     rows, _net = net_memory._rows(target, days, metric)
     if len(rows) < 3:
         return [], 0.0

@@ -121,9 +121,35 @@ CREATE TABLE alert_state (
 ```
 
 **Retention, decided up front rather than when the disk fills:** raw samples for 14 days,
-hourly aggregates (median, p05, p95, count) for 12 months, raw discarded after aggregation.
+hourly aggregates (mean, min, max, count) for 12 months, raw discarded after aggregation.
 At one sample/minute across 10 targets that is ~200k rows raw — trivial — and the aggregate
 table grows at ~90k rows/year. Bounded by construction.
+
+Those aggregate columns were named `median`, `p05`, `p95` while the rollup stored `AVG`,
+`MIN`, `MAX`. Nothing had read the table yet, so the wrong names had never been quoted —
+they would have been, the first time an answer said "the p95 last month was". Renamed while
+the table was still empty, with a best-effort migration for any database that already exists.
+
+**Reading across the horizon is deliberately asymmetric**, and this is the part that took a
+bug to get right. Every reader — `baseline`, `detect_change`, `can_detect`, the seasonality
+test, the sizer — queried the raw table alone, so the day the first prune ran the tool would
+have answered *"No history for 1.1.1.1 in the last 90 days"* with ninety days of it
+summarised in the same file. Saying "I have no record" when the record exists is the same
+class of error as claiming a change that did not happen.
+
+The fix is not simply "read the aggregates too":
+
+| | pre-horizon rows | why |
+|---|---|---|
+| `baseline` — *what did this path look like?* | **used**, labelled as summaries | the question is about the past, and hourly means answer it at lower resolution |
+| floors — `can_detect`, `detect_change`, seasonality, sizing | **refused**, horizon stated | an hourly mean of ~12 samples varies far less than the samples do |
+
+Measured rather than asserted, in `test_net_retention.py`: on identical data the floor comes
+out at **10%** from raw samples and **2%** from hourly means of those same samples. A tool
+that read the aggregates for its floors would announce five times the resolution it has —
+which is precisely the over-claim the rest of this design exists to prevent. So the floors
+stop at 14 days and say so, rather than silently returning a shorter window than was asked
+for.
 
 ---
 

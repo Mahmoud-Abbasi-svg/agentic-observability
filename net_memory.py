@@ -173,6 +173,82 @@ def _rows(target: str, days: float, metric: str = "") -> tuple[list[tuple], dict
     return list(conn().execute(sql + " ORDER BY ts", params)), net
 
 
+# --------------------------------------------------------- beyond the raw retention horizon
+#
+# Raw samples are deleted after net_store.RAW_RETENTION_DAYS and rolled into hourly rows kept
+# for a year. Until this was written, NOTHING read those rows: every reader here, in
+# net_season and in net_size queried `sample` alone. The consequence was not a missing feature
+# but a false statement - `baseline("1.1.1.1", days=90)` answered "No history for '1.1.1.1' on
+# this network in the last 90 days" while ninety days of it sat in the same file, summarised.
+# Saying "I have no record" when the record exists is the same class of error as claiming a
+# change that is not there, and it was ten days from firing for the first time.
+#
+# The split below is not symmetry for its own sake. Rolled-up rows may describe what a path
+# USED to look like, and may never be used to decide what can be DETECTED, because an hourly
+# mean of ~12 samples varies far less than the samples do. A placebo floor calibrated on them
+# would come out narrow, and the tool would announce it could resolve shifts it cannot see -
+# which is exactly the over-claim the whole project is built to avoid. So `baseline` reads
+# them, and every floor stays on raw data and says out loud where its horizon is.
+
+RAW_DAYS = net_store.RAW_RETENTION_DAYS
+
+
+def _hourly(target: str, days: float, metric: str = "") -> list[tuple]:
+    """(hour, metric, mean, lo, hi, n) from the rolled-up table, current network, oldest first.
+
+    Bounded ABOVE by the raw horizon as well as below by `days`, so these rows never overlap
+    the raw ones and a reader cannot double-count the same hour.
+    """
+    net = net_store.network_identity()
+    now = time.time()
+    c_mean, c_lo, c_hi = net_store.hourly_cols(conn())
+    sql = (f"SELECT hour, metric, {c_mean}, {c_lo}, {c_hi}, n FROM sample_hourly "
+           "WHERE target=? AND net_id=? AND hour>=? AND hour<?")
+    params: list[Any] = [target, net["net_id"], int(now - days * 86400),
+                         int(now - RAW_DAYS * 86400)]
+    if metric:
+        sql += " AND metric=?"
+        params.append(metric)
+    return list(conn().execute(sql + " ORDER BY hour", params))
+
+
+def _rolled_up_section(target: str, days: float, metric: str = "") -> str:
+    """Describe pre-horizon history, or return "" when there is none in the asked-for window."""
+    rows = _hourly(target, days, metric)
+    if not rows:
+        return ""
+    by_metric: dict[str, list[tuple]] = {}
+    for _h, m, mean, lo, hi, n in rows:
+        by_metric.setdefault(m, []).append((mean, lo, hi, n))
+    span_d = (rows[-1][0] - rows[0][0]) / 86400.0
+    out = [f"  ---- older than {RAW_DAYS:g} days: rolled up, {len(rows)} hourly rows spanning "
+           f"{span_d:.1f} days ----"]
+    for m, vals in sorted(by_metric.items()):
+        means = [v[0] for v in vals]
+        out.append(f"  {m:18} hours={len(vals)} samples={sum(v[3] for v in vals)} "
+                   f"mean-of-hourly-means={statistics.mean(means):.1f} "
+                   f"min={min(v[1] for v in vals):.1f} max={max(v[2] for v in vals):.1f}")
+    out.append("  These are hourly summaries, not measurements: the raw samples behind them "
+               "were deleted. Use them to say what this path USED to look like. They cannot "
+               "support a change verdict or a resolution limit, because the spread of hourly "
+               "means understates the spread of the samples they came from.")
+    return "\n".join(out)
+
+
+def _horizon_note(days: float, for_floors: bool) -> str:
+    """Say when a requested window reaches past the raw data, instead of silently shortening."""
+    if days <= RAW_DAYS:
+        return ""
+    if for_floors:
+        return (f"  HORIZON         : you asked for {days:g} days; raw samples are kept for "
+                f"{RAW_DAYS:g}, so this used the last {RAW_DAYS:g} days. Older history exists "
+                f"only as hourly summaries and is deliberately excluded here - a floor "
+                f"calibrated on hourly means would come out too narrow and overstate what "
+                f"this path can resolve. Use baseline to see the older period.")
+    return (f"NOTE: {days:g} days were asked for; raw samples reach back {RAW_DAYS:g} days. "
+            f"Anything older is reported separately below, from hourly summaries.")
+
+
 def _describe(values: list[float]) -> str:
     n = len(values)
     if n == 1:
@@ -215,15 +291,32 @@ def baseline(target: str = "", metric: str = "", days: float = 7.0) -> str:
         rows = list(conn().execute(
             "SELECT target, COUNT(*) FROM sample WHERE net_id=? AND ts>=? "
             "GROUP BY target ORDER BY COUNT(*) DESC LIMIT 30", (net["net_id"], cutoff)))
+        older = list(conn().execute(
+            "SELECT target, SUM(n) FROM sample_hourly WHERE net_id=? AND hour>=? "
+            "GROUP BY target ORDER BY SUM(n) DESC LIMIT 30", (net["net_id"], cutoff)))
+        tail = ""
+        if older:
+            tail = (f"\nOlder than {RAW_DAYS:g} days, as hourly summaries only: "
+                    + ", ".join(f"{t} ({c})" for t, c in older))
         if not rows:
+            if older:
+                return (f"No raw samples on network {net['label']!r} in the last {days:g} "
+                        f"days.{tail}")
             return (f"No history on network {net['label']!r} in the last {days:g} days. "
                     f"Measurements taken now will build it. (Other networks may have history; "
                     f"it is deliberately not mixed in.)")
         return (f"Targets with history on network {net['label']!r}, last {days:g} days: "
-                + ", ".join(f"{t} ({c})" for t, c in rows))
+                + ", ".join(f"{t} ({c})" for t, c in rows) + tail)
 
     rows, _ = _rows(target, days, metric)
+    rolled = _rolled_up_section(target, days, metric)
     if not rows:
+        if rolled:
+            # Not "no history" - history that outlived its raw samples. Reporting the first
+            # when the truth is the second is a false statement about what is known.
+            return (f"No raw samples for {target!r} on network {net['label']!r} in the last "
+                    f"{days:g} days - they are kept for {RAW_DAYS:g} days. Rolled-up history "
+                    f"does survive:\n" + rolled)
         known = [r[0] for r in conn().execute(
             "SELECT DISTINCT target FROM sample WHERE net_id=? AND ts>=? LIMIT 20",
             (net["net_id"], cutoff))]
@@ -250,8 +343,11 @@ def baseline(target: str = "", metric: str = "", days: float = 7.0) -> str:
                  "value matching it is not thereby 'normal'.")
     elif span_h < 24:
         head += f"\nNote: history covers {span_h:.1f} h, so it spans no full day-night cycle."
-    return head + "\n" + "\n".join(f"  {k:18} {_describe(v)}"
-                                   for k, v in sorted(by_metric.items()))
+    note = _horizon_note(days, for_floors=False)
+    if note and rolled:
+        head += "\n" + note
+    body = "\n".join(f"  {k:18} {_describe(v)}" for k, v in sorted(by_metric.items()))
+    return head + "\n" + body + (("\n" + rolled) if rolled else "")
 
 
 def _null_deviations(values: list[float], k: int) -> tuple[list[float], float, bool]:
@@ -300,7 +396,8 @@ def assess(target: str, metric: str = "rtt_avg_ms", recent_hours: float = 2.0,
     now = time.time() if now is None else now
     rows, net = _rows(target, baseline_days, metric)
     r = dict(target=target, metric=metric, net_id=net["net_id"], net_label=net["label"],
-             status="insufficient", reason="")
+             status="insufficient", reason="",
+             horizon=_horizon_note(baseline_days, for_floors=True))
     where = f"on network {net['label']!r}"
 
     if len(rows) < 8:
@@ -308,6 +405,13 @@ def assess(target: str, metric: str = "rtt_avg_ms", recent_hours: float = 2.0,
                        f"Change detection needs a history to compare against - at least ~10, "
                        f"ideally spanning a day. Let the collector run, or take more "
                        f"measurements, before asking whether something changed.")
+        # "No record" and "the raw samples expired" are different situations with different
+        # remedies - waiting fixes the first and never fixes the second.
+        if _hourly(target, baseline_days, metric):
+            r["reason"] += (f" (This path DOES have history older than {RAW_DAYS:g} days, but "
+                            f"only as hourly summaries; baseline can show it. It cannot be "
+                            f"used to test for a change, so more raw samples are still what "
+                            f"is needed.)")
         return r
 
     cutoff = now - recent_hours * 3600
@@ -394,6 +498,8 @@ def format_assessment(r: dict) -> str:
     if r["span_h"] < 24:
         out.append(f"  CAVEAT: history spans {r['span_h']:.1f} h, covering no full day-night "
                    f"cycle, so a normal diurnal swing can masquerade as a change.")
+    if r.get("horizon"):
+        out.append(r["horizon"])
     return "\n".join(out)
 
 
@@ -523,6 +629,9 @@ def can_detect(target: str, metric: str = "rtt_avg_ms", shift_pct: float = 10.0,
            f"{centre:.3g}",
            f"  window compared : {k} samples (the last {recent_hours:g} h, which is what "
            f"detect_change compares)"]
+    horizon = _horizon_note(baseline_days, for_floors=True)
+    if horizon:
+        out.append(horizon)
 
     limits = []
     if inst_floor > 0:
