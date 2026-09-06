@@ -303,10 +303,11 @@ def main() -> int:
     for t, m in sorted(pairs):
         print(format_row(assess(t, m, a.days, a.recent_hours)))
 
-    print("\nThe swing is the peak-to-trough of the hourly medians. The null rotates the "
-          "series\nagainst the clock, which keeps the autocorrelation and destroys only the "
-          "alignment to\ntime of day - shuffling the hours instead would collapse the null "
-          "and make almost any\nwander look like a daily rhythm.")
+    print("\nThe swing is the peak-to-trough of the hourly medians, and it decides nothing on "
+          "its own:\na wandering path produces a large swing with no rhythm at all. What is "
+          "tested is whether\nthe shape REPEATS - the history is split in half, an hourly "
+          "profile built for each and\nnormalised by that half's own median, and the two "
+          "rank-correlated against a null that\nenumerates every other hourly alignment.")
     return 0
 
 
