@@ -12,11 +12,14 @@ Two failures, and the second is the one this suite mainly exists for.
               is the dangerous one, because it makes the tool over-claim - the failure the
               whole project is built to avoid.
 
-The false-positive case is exactly what a naive test produces. Shuffling the hour labels
-destroys the correlation between neighbouring samples, so the null spread collapses and any
-slow wander looks like a daily rhythm. `drifting` below is that trap, and the suite checks
-both that the real test resists it AND that the naive one would have fallen for it - because
-a guard that is never shown to be load-bearing tends to get removed later.
+`drifting` below is that trap: strongly autocorrelated, no dependence on the clock, and a
+hourly swing as large as the real rhythm's.
+
+The suite also runs the null this module STARTED with - comparing the hourly spread against
+circularly shifted copies of the series - against the same textbook rhythm the real test
+finds. It does not detect it, because rotating a series whose period is 24 h leaves the hourly
+spread intact. Keeping that here means the reason the first design was abandoned stays visible
+instead of being rediscovered.
 
 Writes only to a throwaway database.
 """
@@ -43,7 +46,11 @@ N = DAYS * 24 * 12
 
 
 def build(target: str, fn) -> list[tuple[float, float]]:
-    now = int(time.time())
+    # Anchored to a whole hour, so every hour bucket holds exactly 3600/STEP samples. Left on
+    # a bare time.time() the fixture straddles hour boundaries differently depending on when
+    # the suite is run, the hourly profile shifts, and the p-values move between runs - a test
+    # that passes in the morning and fails after lunch, which is worse than one that fails.
+    now = int(time.time()) // 3600 * 3600
     rows = []
     for i in range(N):
         ts = now - (N - i) * STEP
@@ -141,10 +148,14 @@ def main() -> int:
     # unchanged. Kept so the mistake stays visible rather than being rediscovered.
     drows = net_season._rows("diurnal", "rtt_avg_ms", 14.0)
     rot = rotation_null_p(drows)
+    # The claim is that the old null FAILS TO DETECT at the conventional level, not that it
+    # lands above some particular value. An earlier version asserted rot > 0.20 and broke when
+    # a rerun produced 0.18 - still nowhere near significance, so the assertion was measuring
+    # run-to-run wobble rather than the property being documented.
     ok &= check("the abandoned circular-shift null misses a rhythm the new test finds",
-                rot > 0.20 and d.get("p", 1.0) < 0.05,
-                f"rotation p={rot:.2f} (blind to it) vs profile agreement "
-                f"p={d.get('p', 1):.3f} (finds it)")
+                rot >= 0.05 and d.get("p", 1.0) < 0.05,
+                f"rotation p={rot:.2f} (does not detect) vs profile agreement "
+                f"p={d.get('p', 1):.3f} (does)")
 
     s = res["short"]
     ok &= check("30 h of history yields no verdict, and says why",
