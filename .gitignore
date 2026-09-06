@@ -41,3 +41,11 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# Database backups. *.db alone missed net_monitor.db.bak-<stamp>, and git add -A would have
+# published the gateway MAC and SSID inside it. Anything that starts with the database name
+# or carries a backup suffix stays local.
+net_monitor.db*
+*.bak
+*.bak-*
+*.bak.*

@@ -395,6 +395,16 @@ def main() -> int:
                     help="do not check the answer's claims against each path's noise floor")
     args = ap.parse_args()
 
+    # The model writes arrows, dashes and the odd non-Latin character, and a Windows console
+    # that is not in UTF-8 raises on the first one - after the measurements were taken and
+    # the answer composed. A whole diagnosis was lost that way to a single U+2192. Replace
+    # what cannot be shown; never let the display decide whether the answer exists.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     backend = args.backend
     if backend == "auto":
         backend = "sdk" if (os.environ.get("ANTHROPIC_API_KEY")
