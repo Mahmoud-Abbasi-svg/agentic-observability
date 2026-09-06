@@ -148,6 +148,13 @@ wherever that happened. A gap is NOT a quiet period: reasoning across one answer
 data on either side of a stretch nobody observed, and states it as confidently as a period \
 that was fully covered. If the period was not observed, say so instead of characterising it.
 
+11. Read the timeline before describing an outage. baseline summarises; it cannot tell 33 \
+consecutive failed probes from 33 scattered ones, and "p95 loss 100%" has been read as \
+"brief dropouts" when it was a half-hour outage. For any "was X down", "how long", "was the \
+network healthy tonight" question, call availability: it lists the runs in order, with their \
+length, whether they ended or measurement simply stopped, and whether every host failed \
+together (the network) or one did (that host).
+
 11. When you cannot resolve something, say what would. can_detect tells you the current setup \
 is not precise enough; instrument_options tells you which of your instruments, if any, could \
 be. It runs real measurements and takes tens of seconds, so use it when a resolution question \
@@ -177,6 +184,7 @@ TOOLS = {**MEASUREMENT_TOOLS,
          "detect_change": net_memory.detect_change,
          "can_detect": net_memory.can_detect,
          "coverage": net_memory.coverage,
+         "availability": net_memory.availability,
          "instrument_options": net_precision.instrument_options}
 
 

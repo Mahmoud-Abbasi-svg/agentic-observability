@@ -790,6 +790,240 @@ def coverage(hours: float = 24.0, target: str = "") -> str:
     return "\n".join(out)
 
 
+# --------------------------------------------------------------------------- availability
+#
+# The first tool whose need was established by real data rather than supposed. On 2026-09-06
+# the network was cut for 33 minutes and the collector recorded every failed probe correctly.
+# Asked afterwards whether the evening was healthy, the agent read baseline's summary -
+# "median 0%, p95 100%" - and described a contiguous half-hour of total failure as "brief
+# cellular dropouts, episodes not a steady condition". It was not wrong about the summary. The
+# summary was wrong about the event: a distribution cannot tell 33 consecutive failures from
+# 33 scattered ones, and nothing else presented the samples in order.
+
+def _fmt_t(ts: float, now: float) -> str:
+    return "now" if abs(ts - now) < 1 else time.strftime("%d %b %H:%M", time.localtime(ts))
+
+
+def _fmt_dur(s: float) -> str:
+    if s < 60:
+        return "<1 min"
+    return f"{s / 60:.0f} min" if s < 5400 else f"{s / 3600:.1f} h"
+
+
+def _runs(rows: list[tuple], since: float, now: float, beats: list[int],
+          beat_cadence: float) -> list[dict]:
+    """Cut an ordered (ts, reachable) series into contiguous runs of up / down / gap.
+
+    A run ends where the next run begins, so the pieces tile the window: a DOWN run's end is
+    the first successful probe after it. A run followed by a gap has no known end and carries
+    `open_end`, because "it was still down when we stopped looking" and "it recovered" are
+    different statements and the data only supports the first.
+    """
+    diffs = [b[0] - a[0] for a, b in zip(rows, rows[1:]) if b[0] > a[0]]
+    cadence = statistics.median(diffs) if diffs else 0.0
+    threshold = max(4 * cadence, 300.0)          # same rule as coverage, deliberately
+
+    def gap(a: float, b: float) -> dict:
+        # Against the EXPECTED count, not merely non-zero: a gap's edges are sample times,
+        # and the collector's heartbeat for that same cycle lands a few seconds later, inside
+        # the gap. On real data a three-hour sleep came out as "collector ran 1 cycle", which
+        # is true and misleading. One stray cycle in three hours is not a running collector.
+        n_beats = sum(1 for t in beats if a < t < b)
+        expected = (b - a) / beat_cadence if beat_cadence > 0 else 0.0
+        return dict(kind="gap", start=a, end=b, n=0, beats=n_beats, expected=expected)
+
+    runs: list[dict] = []
+    if rows[0][0] - since > threshold:
+        runs.append(gap(since, rows[0][0]))
+    cur = dict(kind="up" if rows[0][1] else "down", start=rows[0][0], end=rows[0][0], n=1)
+    for (pt, _pv), (t, v) in zip(rows, rows[1:]):
+        kind = "up" if v else "down"
+        if t - pt > threshold:
+            cur["open_end"] = True
+            runs.append(cur)
+            runs.append(gap(pt, t))
+            cur = dict(kind=kind, start=t, end=t, n=1)
+        elif kind == cur["kind"]:
+            cur["end"], cur["n"] = t, cur["n"] + 1
+        else:
+            cur["end"] = t
+            runs.append(cur)
+            cur = dict(kind=kind, start=t, end=t, n=1)
+    if now - rows[-1][0] > threshold:
+        cur["open_end"] = True
+        runs.append(cur)
+        runs.append(gap(rows[-1][0], now))
+    else:
+        cur["end"], cur["ongoing"] = now, True
+        runs.append(cur)
+    return runs
+
+
+def _availability_one(target: str, since: float, now: float, net: dict, beats: list[int],
+                      beat_cadence: float) -> tuple[str, list[tuple], list[tuple]]:
+    """Text for one host, plus its DOWN intervals and its OBSERVED (up or down) intervals."""
+    rows = list(conn().execute(
+        "SELECT ts, value FROM sample WHERE target=? AND metric='reachable' AND net_id=? "
+        "AND ts>=? ORDER BY ts", (target, net["net_id"], since)))
+    head = f"availability of {target} on network {net['label']!r}, last {_fmt_dur(now - since)}"
+    if not rows:
+        return (f"{head}: no reachability probes recorded. Use coverage to see whether "
+                f"anything at all was measured in this period."), [], []
+
+    runs = _runs(rows, since, now, beats, beat_cadence)
+    out = [f"{head}: {len(rows)} probes"]
+    down_ivs: list[tuple[float, float]] = []
+    seen_ivs: list[tuple[float, float]] = []
+    for i, r in enumerate(runs):
+        span = f"  {_fmt_t(r['start'], now)} -> {_fmt_t(r['end'], now)}"
+        dur = _fmt_dur(r["end"] - r["start"])
+        if r["kind"] == "gap":
+            if r["beats"] == 0:
+                why = "collector was not running"
+            elif r["expected"] > 0 and r["beats"] / r["expected"] < 0.25:
+                why = (f"collector was not running - only {r['beats']} of ~{r['expected']:.0f} "
+                       f"expected cycles")
+            else:
+                why = f"collector ran {r['beats']} cycles but did not probe this host"
+            out.append(f"{span}   NOT MEASURED  {dur:>8}   ({why})")
+            continue
+        seen_ivs.append((r["start"], r["end"]))
+        if r["kind"] == "down":
+            down_ivs.append((r["start"], r["end"]))
+            what = "1 failed probe" if r["n"] == 1 else f"{r['n']} consecutive failures"
+            line = f"{span}   DOWN          {dur:>8}   ({what})"
+            if r.get("open_end"):
+                nxt = runs[i + 2] if i + 2 < len(runs) else None
+                line += (f"\n{'':>36}END UNKNOWN: still down when measurement stopped at "
+                         f"{_fmt_t(r['end'], now)}")
+                if nxt:
+                    line += (f"; the next observation, at {_fmt_t(nxt['start'], now)}, "
+                             f"was {nxt['kind']}")
+            elif r.get("ongoing"):
+                line += f"\n{'':>36}STILL DOWN at the latest probe"
+            out.append(line)
+        else:
+            out.append(f"{span}   up            {dur:>8}   ({r['n']} probes)")
+
+    downs = [r for r in runs if r["kind"] == "down"]
+    gaps = [r for r in runs if r["kind"] == "gap"]
+    ups = [r for r in runs if r["kind"] == "up"]
+    tot = lambda rs: sum(r["end"] - r["start"] for r in rs)          # noqa: E731
+    summary = f"  summary: up {_fmt_dur(tot(ups))}"
+    if downs:
+        longest = max(downs, key=lambda r: r["end"] - r["start"])
+        summary += (f"; DOWN {_fmt_dur(tot(downs))} in {len(downs)} run(s), longest "
+                    f"{_fmt_dur(longest['end'] - longest['start'])} from "
+                    f"{_fmt_t(longest['start'], now)}")
+        if any(r["n"] == 1 for r in downs):
+            summary += (f"; {sum(1 for r in downs if r['n'] == 1)} of the runs are a single "
+                        f"dropped probe, which is not an outage")
+    else:
+        summary += "; never observed down"
+    if gaps:
+        summary += f"; NOT MEASURED {_fmt_dur(tot(gaps))}"
+    out.append(summary)
+    return "\n".join(out), down_ivs, seen_ivs
+
+
+def _all_down(down: dict[str, list[tuple]], seen: dict[str, list[tuple]]) -> list[tuple]:
+    """Intervals during which every host UNDER OBSERVATION AT THE TIME was down.
+
+    "At the time" is the whole point. The first version required every listed host to be
+    down, and on the real outage answered "no period where all 7 hosts were down together" -
+    because three of the seven were hosts the agent had probed once, after the fact, and one
+    was the gateway the collector could not probe while the link was gone. A host with no
+    data at 20:40 is not evidence that 20:40 was fine. Hosts with no observation at a moment
+    have no vote on it, and at least two must be watching for "all of them" to mean anything.
+    """
+    pts = sorted({p for ivs in seen.values() for iv in ivs for p in iv})
+    out: list[tuple] = []
+
+    def covers(ivs: list[tuple], x: float) -> bool:
+        return any(s <= x < e for s, e in ivs)
+
+    for a, b in zip(pts, pts[1:]):
+        mid = (a + b) / 2
+        watching = [t for t, ivs in seen.items() if covers(ivs, mid)]
+        if len(watching) >= 2 and all(covers(down.get(t, []), mid) for t in watching):
+            if out and out[-1][1] == a:
+                out[-1] = (out[-1][0], b)
+            else:
+                out.append((a, b))
+    return out
+
+
+def availability(target: str = "", hours: float = 24.0) -> str:
+    """When was a host reachable, when was it not, and when was nobody looking - in order.
+
+    This is the only tool that shows TIME. baseline gives a distribution, coverage says when
+    nothing was measured, detect_change compares two windows. None of them presents the
+    samples in sequence, and that loses the shape of an event: thirty-three consecutive
+    failed probes and thirty-three scattered ones both come out of baseline as "median 0%,
+    p95 100%". Only the sequence tells an outage from a run of dropped cycles.
+
+    Reports contiguous runs, each one of three things:
+      DOWN          consecutive failed probes. Its end is the next SUCCESSFUL probe. A run
+                    that is followed by a gap has no known end and says END UNKNOWN - "still
+                    down when we stopped looking" is not "recovered".
+      NOT MEASURED  no probe for far longer than the usual cadence, labelled with whether the
+                    collector was running at the time or not.
+      up            consecutive successful probes.
+
+    Use it for "was X down", "how long was the outage", "was the network healthy tonight".
+    A single failed probe is one dropped cycle, not an outage; the run length is shown so
+    the two cannot be confused.
+
+    Args:
+        target: Host, IP or URL. Leave empty for every host with availability data, plus the
+            periods when ALL of them were down together - which is what a network outage
+            looks like, as opposed to one host failing.
+        hours: How far back to examine.
+    """
+    net = net_store.network_identity()
+    now = time.time()
+    since = int(now - hours * 3600)
+    beats = [r[0] for r in conn().execute(
+        "SELECT ts FROM heartbeat WHERE net_id=? AND ts>=? ORDER BY ts",
+        (net["net_id"], since))]
+    bdiffs = [b - a for a, b in zip(beats, beats[1:]) if b > a]
+    beat_cadence = statistics.median(bdiffs) if bdiffs else 0.0
+
+    if target:
+        return _availability_one(target, since, now, net, beats, beat_cadence)[0]
+
+    counts = list(conn().execute(
+        "SELECT target, COUNT(*) FROM sample WHERE net_id=? AND metric='reachable' AND ts>=? "
+        "GROUP BY target ORDER BY target", (net["net_id"], since)))
+    if not counts:
+        return (f"No availability data on network {net['label']!r} in the last {hours:g} h. "
+                f"Use coverage to see whether anything was measured.")
+    # A host probed once or twice - typically by the agent, while answering something else -
+    # has no timeline worth a block of its own, and its presence in the list makes "all hosts"
+    # mean less. Named, not hidden.
+    monitored = [t for t, n in counts if n >= 3]
+    sparse = [t for t, n in counts if n < 3]
+    parts, down, seen = [], {}, {}
+    for t in monitored:
+        text, d_ivs, s_ivs = _availability_one(t, since, now, net, beats, beat_cadence)
+        parts.append(text)
+        down[t], seen[t] = d_ivs, s_ivs
+    if sparse:
+        parts.append(f"Probed fewer than 3 times, so no timeline: {', '.join(sparse)}. "
+                     f"Ask for one by name if it matters.")
+    if len(monitored) > 1:
+        together = _all_down(down, seen)
+        if together:
+            parts.append("EVERY host under observation was down at once - the signature of "
+                         "the network itself, not of one host:\n" + "\n".join(
+                             f"  {_fmt_t(a, now)} -> {_fmt_t(b, now)}   {_fmt_dur(b - a)}"
+                             for a, b in together))
+        elif any(down.values()):
+            parts.append("At no point was every host under observation down together: the "
+                         "failures above are per-host, not a network outage.")
+    return "\n\n".join(parts)
+
+
 # --------------------------------------------------------------------------- migration
 
 def import_jsonl(path: str, assume_current_network: bool = False) -> str:

@@ -52,7 +52,7 @@ diagnosis without a retry.
 |---|---|
 | `net_tools.py` | the eight diagnostic tools. Importable and runnable on its own — `python net_tools.py` exercises each one |
 | `net_store.py` | SQLite store, retention policy, and the network identity (`net_id`) |
-| `net_memory.py` | `baseline`, `detect_change`, `can_detect`, `coverage`, and the `assess` statistics behind them |
+| `net_memory.py` | `baseline`, `detect_change`, `can_detect`, `coverage`, `availability`, and the `assess` statistics behind them |
 | `net_precision.py` | `instrument_options` — measures the agent's own instruments to find which could resolve a given change |
 | `net_season.py` | tests each signal for a repeatable daily rhythm, and narrows the floor only where one is real |
 | `net_size.py` | sets each target's sampling interval from the resolution you need — `python net_size.py [--apply]` |
@@ -255,6 +255,46 @@ And the agent's answer to that question now opens:
 
 > *"I can't tell you, and that is the honest finding — last night was not measured... Anyone
 > telling you the night looked quiet is reading data from either side of a gap."*
+
+### `availability` — the shape of an event, not its statistics
+
+The first tool whose need was established by real data rather than supposed. On 2026-09-06
+the network was cut deliberately for 33 minutes ([the pre-registered
+record](OUTAGE_2026-09-06.md)). The collector recorded every failed probe. Asked afterwards
+whether the evening was healthy, the agent read `baseline`'s summary — *median 0%, p95 100%*
+— and described the outage as *"brief cellular dropouts, episodes not a steady condition."*
+
+It was not wrong about the summary. The summary was wrong about the event. A distribution
+cannot tell thirty-three consecutive failures from thirty-three scattered ones, and nothing
+else presented the samples in order. This does:
+
+```
+availability of 1.1.1.1 on network 'hotspot', last 8.0 h: 128 probes
+  06 Sep 19:44 -> 06 Sep 20:03   up              19 min   (40 probes)
+  06 Sep 20:03 -> 06 Sep 20:18   NOT MEASURED    15 min   (collector was not running - only 2 of ~16 expected cycles)
+  06 Sep 20:18 -> 06 Sep 20:28   up              10 min   (13 probes)
+  06 Sep 20:28 -> 06 Sep 21:00   DOWN            32 min   (41 consecutive failures)
+                                    END UNKNOWN: still down when measurement stopped at 06 Sep 21:00; the next observation, at 07 Sep 00:04, was up
+  06 Sep 21:00 -> 07 Sep 00:04   NOT MEASURED     3.1 h   (collector was not running - only 1 of ~189 expected cycles)
+  07 Sep 00:04 -> now   up              24 min   (34 probes)
+  summary: up 53 min; DOWN 32 min in 1 run(s), longest 32 min from 06 Sep 20:28; NOT MEASURED 6.6 h
+
+EVERY host under observation was down at once - the signature of the network itself, not of one host:
+  06 Sep 20:29 -> 06 Sep 21:00   31 min
+```
+
+Three things in that output were each got wrong once before they were got right:
+
+- **A run's end is the next successful probe** — and a run followed by a gap has *no known
+  end*. "Still down when we stopped looking" and "recovered" are different statements, and the
+  data supports only the first.
+- **"Every host" means every host under observation *at that moment*.** The first version
+  required every listed host to be down and concluded there was no network outage — because
+  three of the seven hosts were ones the agent had probed once, afterwards. A host with no data
+  at 20:40 is not evidence that 20:40 was fine.
+- **A gap is judged against the expected cycle count, not against zero.** The heartbeat for
+  the last cycle before sleep lands seconds after its samples, inside the gap, and a three-hour
+  sleep came out as "collector ran 1 cycle". True, and misleading.
 
 ## The monitor
 
