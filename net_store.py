@@ -273,7 +273,7 @@ def _identity_from_db(net_id: str) -> dict:
             f"{REPLAY_ENV}={net_id} but no such network is recorded in {path}.\n"
             f"Ingest a capture first, or unset {REPLAY_ENV} to use the live network.")
     return dict(net_id=row[0], label=row[1], gateway=row[2], gw_mac=row[3],
-                ssid=row[4], subnet=row[5], strength="replay")
+                ssid=row[4], subnet=row[5], strength="replay", assumed=False)
 
 
 def network_identity(force: bool = False) -> dict:
@@ -299,17 +299,92 @@ def network_identity(force: bool = False) -> dict:
     # Prefer the MAC; fall back to gateway+subnet, which still separates most real moves.
     if mac:
         basis, strength = f"mac:{mac}|{subnet or ''}", "strong"
-    elif gw or subnet:
-        basis, strength = f"gw:{gw or ''}|{subnet or ''}|{ssid or ''}", "weak"
     else:
-        basis, strength = "offline", "none"
+        # The link is down or degraded. Losing the gateway MAC is evidence about the LINK,
+        # not about which network this machine is attached to - you do not move house because
+        # your router stopped answering ARP. Minting a new net_id here is therefore wrong, and
+        # a deliberate outage on 2026-09-06 showed how wrong: identity fragmented in stages as
+        # the link died, 929d15ad (mac+ssid) -> 484c3993 (subnet only) -> "offline", and the
+        # 33 minutes of the outage landed under a network that had never existed.
+        #
+        # Three failures followed from that one, and none of them announced itself:
+        #   * no alert fired, because a brand-new net_id has no history to compare against, so
+        #     the monitor watched the network die and said nothing;
+        #   * `coverage` reported the outage as an UNOBSERVED gap on the real network - the
+        #     tool disowning 151 samples it had correctly taken, which is the exact inversion
+        #     of the honesty it is built for;
+        #   * "offline" hashes to one constant, so every outage on every network would have
+        #     accumulated in a single shared bucket for ever.
+        #
+        # So a degraded reading now sticks to the last strongly-identified network, provided
+        # nothing observable contradicts it and it was seen recently enough to still be true.
+        prev = _last_strong_identity(IDENTITY_STICKY_S)
+        if prev and not _contradicts(prev, gw, ssid, subnet):
+            info = dict(net_id=prev["net_id"], label=prev["label"], gateway=prev["gateway"],
+                        gw_mac=prev["gw_mac"], ssid=prev["ssid"], subnet=prev["subnet"],
+                        strength="assumed", assumed=True)
+            _CACHE.update(at=now, info=info)
+            return info
+        # Nothing recent to attach to, so the network genuinely is unknown. Say that rather
+        # than guessing: an "offline" bucket is not a network and must never be read as one.
+        if gw or subnet:
+            basis, strength = f"gw:{gw or ''}|{subnet or ''}|{ssid or ''}", "weak"
+        else:
+            basis, strength = "offline", "none"
     net_id = hashlib.sha1(basis.encode()).hexdigest()[:12]
     label = ssid or gw or subnet or "offline"
 
     info = dict(net_id=net_id, label=label, gateway=gw, gw_mac=mac, ssid=ssid,
-                subnet=subnet, strength=strength)
+                subnet=subnet, strength=strength, assumed=False)
     _CACHE.update(at=now, info=info)
     return info
+
+
+# How long a strong identity stays usable as the answer to "which network is this?" once the
+# link degrades. An hour covers an outage, a reboot and a suspend; beyond that the machine may
+# genuinely have moved while it could not see, and attributing an unreachable period to the
+# wrong network would poison that network's availability baseline with someone else's outage.
+IDENTITY_STICKY_S = 3600.0
+
+
+def _last_strong_identity(within: float) -> Optional[dict]:
+    """The most recent MAC-identified network, if it was seen inside `within` seconds.
+
+    Opened read-only and separately from connect(): this runs on the identity path, which the
+    collector hits every cycle, and it must never create a file, run a migration or take a
+    write lock. Any failure means "no candidate", never an exception - degraded identity is
+    already the unhappy path and must not become a crash.
+    """
+    path = os.environ.get("NET_MONITOR_DB", DB_PATH)     # read at call time, never frozen
+    if not os.path.exists(path):
+        return None
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        try:
+            row = c.execute(
+                "SELECT net_id,label,gateway,gw_mac,ssid,subnet FROM net "
+                "WHERE gw_mac IS NOT NULL AND last_seen>=? ORDER BY last_seen DESC LIMIT 1",
+                (int(time.time() - within),)).fetchone()
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return None
+    keys = ("net_id", "label", "gateway", "gw_mac", "ssid", "subnet")
+    return dict(zip(keys, row)) if row else None
+
+
+def _contradicts(prev: dict, gw: Optional[str], ssid: Optional[str],
+                 subnet: Optional[str]) -> bool:
+    """Does what can still be read rule out being on `prev`?
+
+    Only positive evidence counts. A field that cannot be read says nothing - that is the
+    whole situation being handled - so absence never contradicts. A field that CAN be read and
+    disagrees is a real move, and then a new identity is correct.
+    """
+    for seen, before in ((subnet, prev["subnet"]), (gw, prev["gateway"]), (ssid, prev["ssid"])):
+        if seen and before and seen != before:
+            return True
+    return False
 
 
 def remember_net(conn: sqlite3.Connection, info: dict) -> None:

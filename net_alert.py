@@ -95,7 +95,18 @@ MIN_ABSOLUTE_SHIFT = {
 # Nobody should be woken because the network got faster.
 LOWER_IS_WORSE = {"reachable", "success_rate", "ok_2xx"}
 
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "net_alerts.log")
+def log_path() -> str:
+    """The alert log lives beside the database it describes, resolved at call time.
+
+    It was a constant frozen at import to this directory, and that put FIXTURE alerts in the
+    live operational log: test_net_alert.py points NET_MONITOR_DB at a temp file, but the log
+    path did not follow, so the record an operator reads carried repeated alerts about
+    'quiet-big' - a target that does not exist - timestamped minutes before a real outage that
+    produced no alert at all. Tying the log to the database makes that impossible rather than
+    merely discouraged, and is the same fix as net_store's frozen DB_PATH once needed.
+    """
+    db = os.environ.get("NET_MONITOR_DB") or net_store.DB_PATH
+    return os.path.join(os.path.dirname(os.path.abspath(db)), "net_alerts.log")
 CONFIG_PATH = os.environ.get(
     "NET_MONITOR_CONFIG",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.json"))
@@ -170,7 +181,7 @@ def notify(conn: sqlite3.Connection, kind: str, r: dict, text: str, now: int,
            webhook: str = "") -> None:
     print("\n" + text + "\n", flush=True)
     try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
+        with open(log_path(), "a", encoding="utf-8") as f:
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}] {text}\n\n")
     except OSError:
         pass
