@@ -64,13 +64,25 @@ SCENARIOS = [
          must_not=[r"\bhost is (down|unreachable)\b", r"\bexample\.com is (down|unreachable)\b"],
          want_tools={"check_port", "tcp_latency"}),
 
-    dict(id="dns_config", category="FAULT",
+    # Rewritten after a real outage. The original expectation graded the agent for reporting
+    # "unreachable configured resolvers" - which were the resolvers of a DISCONNECTED Ethernet
+    # adapter, listed by local_network in one flat list alongside the active adapter's. The
+    # scenario was rewarding the misdiagnosis it should have caught, and the agent then made
+    # it twice on live data, blaming a correctly-configured laptop for a hotspot resolver
+    # that refuses one name. The expectation now depends on structure, not on which network
+    # the machine happens to be on.
+    dict(id="dns_config", category="CALIBRATION",
          question="Is my DNS configuration correct?",
-         expect="At least one configured resolver is unreachable from this network "
-                "(192.168.88.1 is on a different subnet; the 203.0.113.x servers do "
-                "not answer). Name resolution still works via fallback.",
-         must_not=[],
-         want_tools={"local_network"}),
+         expect="The answer must identify which resolver this machine is ACTUALLY using - the "
+                "one on the adapter that carries the default route - and test that one. "
+                "Resolvers configured on a disconnected adapter are not in use and must NOT "
+                "be reported as a fault or as 'stale configuration'; mentioning them as "
+                "irrelevant is fine. If the active resolver answers, the configuration is "
+                "correct, whatever the inactive adapters hold. If it fails for some names but "
+                "not others, that is the resolver's behaviour, not this machine's config.",
+         must_not=[r"\bstale (dns|resolver|configuration)\b",
+                   r"\bmisconfigur\w* (dns|resolver)\b"],
+         want_tools={"local_network", "dns_query_server"}),
 
     dict(id="false_premise_cf", category="CLEAN",
          question="Why is 1.1.1.1 unreachable from this machine?",

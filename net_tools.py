@@ -18,6 +18,7 @@ Runnable on its own: `python net_tools.py` exercises every tool once against a p
 """
 from __future__ import annotations
 
+import json
 import platform
 import re
 import shutil
@@ -207,6 +208,14 @@ def dns_lookup(name: str, record_type: str = "A") -> str:
                 + "\n".join(addrs))
 
     resolver = dns.resolver.Resolver()
+    # Ask the servers the OS asks. Left to itself, dnspython on Windows collects the resolvers
+    # of every adapter - a disconnected Ethernet port's included - and walks them in order.
+    # An earlier version of this tool did exactly that, timed out on three servers the OS
+    # never uses, and then TOLD the agent, in the text below, that the machine's DNS was
+    # misconfigured. The agent repeated it twice on live data. The machine was fine.
+    active = _active_resolvers()
+    if active:
+        resolver.nameservers = active
     resolver.timeout, resolver.lifetime = 2.0, 6.0
     t0 = time.perf_counter()
     try:
@@ -215,11 +224,12 @@ def dns_lookup(name: str, record_type: str = "A") -> str:
         ms = (time.perf_counter() - t0) * 1000
         note = (f"name={name} type={record_type} failed_after_ms={ms:.1f}\n"
                 f"{type(e).__name__}: {e}\n"
-                f"configured_resolvers={resolver.nameservers}")
-        # The configured resolver list can contain servers that are not reachable from the
-        # current network (a stale entry from another Wi-Fi, a VPN left in the registry).
-        # The OS resolver may still work, and the DIFFERENCE between the two is itself the
-        # diagnosis - so try it and say so explicitly rather than only reporting failure.
+                f"resolvers_asked={resolver.nameservers}"
+                + ("" if active else "  (library default: may include adapters not in use)"))
+        # Compare with the OS resolver and report the difference as an observation, not a
+        # verdict. When both used the same servers, the OS succeeding usually means its cache
+        # answered; when this tool fell back to the library default, the difference says
+        # nothing about the machine's configuration at all.
         if record_type in ("A", "AAAA"):
             fam = socket.AF_INET if record_type == "A" else socket.AF_INET6
             try:
@@ -228,11 +238,16 @@ def dns_lookup(name: str, record_type: str = "A") -> str:
                 ms2 = (time.perf_counter() - t1) * 1000
                 addrs = sorted({i[4][0] for i in infos})
                 note += (f"\n\nBUT the OS resolver SUCCEEDED in {ms2:.1f} ms: {addrs}\n"
-                         "=> name resolution works; one or more CONFIGURED DNS servers above "
-                         "are unreachable from this network. That misconfiguration, not the "
-                         "name, is the fault.")
+                         "=> the name resolves on this machine. The difference is the OS "
+                         "cache, or a resolver this tool did not ask; it is NOT evidence of "
+                         "a misconfiguration. Use local_network to see which resolver the "
+                         "routed adapter uses, and dns_query_server to test it directly.")
             except socket.gaierror as e2:
-                note += f"\n\nOS resolver also failed: {e2}"
+                note += (f"\n\nOS resolver also failed: {e2}\n"
+                         "=> the name does not resolve on this machine right now. Test the "
+                         "routed adapter's resolver directly with dns_query_server, and a "
+                         "public one, to separate 'this resolver refuses it' from 'the name "
+                         "does not exist'.")
         return note
     ms = (time.perf_counter() - t0) * 1000
     recs = [r.to_text() for r in ans]
@@ -358,14 +373,109 @@ def http_check(url: str) -> str:
         return f"url={url} FAILED after_ms={ms:.1f} ({type(e).__name__}: {e})"
 
 
+def _as_list(v) -> list[str]:
+    """The adapter fields arrive as comma-joined strings; split, and drop empties/nulls."""
+    if not v or not isinstance(v, str):
+        return []
+    return [x.strip() for x in v.split(",") if x.strip()]
+
+
+def _windows_adapters() -> list[dict]:
+    """Every adapter with its status, address, gateway and resolvers, from PowerShell.
+
+    PowerShell rather than `ipconfig /all` because the cmdlet's property values are not
+    localised, and this machine prints ipconfig in whichever language Windows was installed
+    in. A fixed command with no user input, run as an argument list - no shell.
+
+    Lists are joined into strings on the PowerShell side on purpose. Windows PowerShell 5.1
+    serialises a nested collection as {"value": [...], "Count": n} rather than as an array,
+    and the first version printed "dns value, Count" for the one adapter that had several
+    resolvers - which was the adapter the whole fix was about.
+    """
+    now = time.time()
+    if now - _ADAPTERS["at"] < 30:                 # a question makes several lookups; one launch
+        return list(_ADAPTERS["data"])
+    script = ("Get-NetIPConfiguration -All | Select-Object InterfaceAlias,"
+              "@{n='status';e={[string]$_.NetAdapter.Status}},"
+              "@{n='ip';e={@($_.IPv4Address.IPAddress) -join ','}},"
+              "@{n='gw';e={@($_.IPv4DefaultGateway.NextHop) -join ','}},"
+              "@{n='dns';e={@(($_.DNSServer | Where-Object AddressFamily -eq 2)"
+              ".ServerAddresses) -join ','}} | ConvertTo-Json -Compress")
+    rc, raw = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                   timeout=25)
+    start = min((i for i in (raw.find("["), raw.find("{")) if i >= 0), default=-1)
+    data: list[dict] = []
+    if rc == 0 and start >= 0:
+        try:
+            parsed = json.loads(raw[start:])
+            data = [parsed] if isinstance(parsed, dict) else list(parsed)
+        except ValueError:
+            data = []
+    _ADAPTERS.update(at=now, data=data)
+    return list(data)
+
+
+_ADAPTERS: dict = {"at": 0.0, "data": []}
+
+
+def _active_resolvers() -> list[str]:
+    """The DNS servers of the adapter(s) that carry a default route - what the OS actually
+    uses for internet names. Empty when that cannot be established (non-Windows, or
+    PowerShell unavailable), in which case the resolver library's own default stands.
+
+    This exists because dnspython on Windows gathers the resolvers of EVERY adapter, unplugged
+    ones included, and tries them in order. On this machine that meant three unreachable
+    servers from a disconnected Ethernet port, six seconds of timeouts, and a diagnosis of
+    "stale DNS configuration" for a laptop whose OS was resolving names in 8 ms.
+    """
+    out: list[str] = []
+    for a in _windows_adapters():
+        if str(a.get("status")).lower() == "up" and _as_list(a.get("gw")):
+            out.extend(d for d in _as_list(a.get("dns")) if d not in out)
+    return out
+
+
 def local_network() -> str:
-    """Report this machine's own network configuration: interfaces, addresses and DNS servers.
+    """Report this machine's own network configuration, PER ADAPTER: status, address, default
+    gateway and DNS resolvers, with the adapter that carries the default route marked.
 
     Use this to establish the baseline before blaming anything remote - a machine with no
     default gateway, an APIPA 169.254.x.x address, or an unreachable DNS server will look like
     "the internet is down" from every other tool.
+
+    Read the adapter, not just the list. Resolvers on a DISCONNECTED adapter are not in use:
+    an earlier version printed every adapter's resolvers in one flat list, and given
+    "192.168.88.1, 212.128.130.140, 172.20.10.1" plus a failed lookup, the natural reading was
+    "stale resolvers from another network". The machine was correctly configured; the first
+    two belonged to an unplugged Ethernet port, and the hotspot's own resolver was refusing
+    one name. Only the adapter marked as carrying the default route decides what this machine
+    uses.
     """
     out: list[str] = []
+    adapters = _windows_adapters() if IS_WINDOWS else []
+    if adapters:
+        # Live adapters first, and only the ones that say something.
+        adapters.sort(key=lambda a: (str(a.get("status")) != "Up", not _as_list(a.get("gw"))))
+        for a in adapters:
+            status = str(a.get("status") or "?").lower()
+            ips = [ip for ip in _as_list(a.get("ip")) if not ip.startswith("169.254.")]
+            gws, dns = _as_list(a.get("gw")), _as_list(a.get("dns"))
+            if status != "up" and not dns:
+                continue                                  # a dead adapter with nothing to say
+            line = f"{a.get('InterfaceAlias', '?')}: {status}"
+            line += f" {', '.join(ips)}" if ips else " (no usable address)"
+            if gws:
+                line += f"  gateway {', '.join(gws)}  <- CARRIES THE DEFAULT ROUTE"
+            if dns:
+                line += f"\n    dns {', '.join(dns)}"
+                if status != "up":
+                    line += "  (adapter is down: these resolvers are NOT in use)"
+                elif not gws:
+                    line += "  (no default route here: not what internet lookups use)"
+            out.append(line)
+        out.append(f"hostname: {socket.gethostname()}")
+        return "\n".join(out)
+
     try:
         import psutil
         stats = psutil.net_if_stats()
