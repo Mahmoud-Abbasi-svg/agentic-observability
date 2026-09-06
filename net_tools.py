@@ -19,6 +19,7 @@ Runnable on its own: `python net_tools.py` exercises every tool once against a p
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
 import shutil
@@ -338,6 +339,47 @@ def check_port(host: str, port: int) -> str:
         return f"host={host} port={port} CLOSED_OR_FILTERED after_ms={ms:.1f} ({type(e).__name__}: {e})"
 
 
+def _http_context():
+    """The system trust store plus certifi's bundle, when certifi is installed.
+
+    Python on Windows enumerates the local ROOT store, and this machine's OpenSSL 1.1.1 could
+    not build a chain for Let's Encrypt's 2026 intermediates from it: "certificate has
+    expired" for cloudflare.com and wikipedia.org, both valid to November. Windows verified
+    them - SChannel fetches a missing intermediate on demand, OpenSSL does not. Adding
+    certifi's maintained bundle ON TOP of the system store closes the gap without dropping
+    any CA an organisation installed locally.
+    """
+    import ssl
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+
+def _schannel_check(url: str) -> Optional[tuple[int, int, float]]:
+    """(http_code, ssl_verify_result, seconds) from Windows' own TLS stack.
+
+    Via the curl.exe that ships in System32 - that one specifically, not whichever curl is
+    first on PATH, because Git's curl uses OpenSSL with its own bundle and would only repeat
+    the question. None when unavailable, so the caller falls back to a plain failure.
+    """
+    if not IS_WINDOWS:
+        return None
+    exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "curl.exe")
+    if not os.path.exists(exe):
+        return None
+    rc, raw = _run([exe, "-sS", "-o", os.devnull, "-w",
+                    "%{http_code} %{ssl_verify_result} %{time_total}",
+                    "-I", "--max-time", "10", url], timeout=15)
+    m = re.search(r"(\d{3}) (\d+) ([\d.]+)\s*$", raw)
+    if rc != 0 or not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), float(m.group(3))
+
+
 def http_check(url: str) -> str:
     """Fetch just the headers of an HTTP(S) URL and report status and timing.
 
@@ -345,9 +387,15 @@ def http_check(url: str) -> str:
     fine, accept TCP on 443, and still return 502. Only the headers are fetched, so this is
     cheap and reads no page content.
 
+    A TLS verification failure is checked against Windows' own TLS stack before being
+    reported. If Windows verifies the certificate, the failure was this tool's trust store,
+    not the site, and the result says so - the status Windows got is reported as the
+    measurement. Only when both fail is the certificate reported as untrusted.
+
     Args:
         url: Full URL including scheme, e.g. "https://example.com".
     """
+    import ssl
     import urllib.error
     import urllib.request
 
@@ -358,7 +406,7 @@ def http_check(url: str) -> str:
                                 headers={"User-Agent": "net-observability-agent/1.0"})
     t0 = time.perf_counter()
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=10, context=_http_context()) as r:
             ms = (time.perf_counter() - t0) * 1000
             hdrs = {k.lower(): v for k, v in r.headers.items()}
             keep = {k: hdrs[k] for k in ("server", "content-type", "location", "cache-control")
@@ -370,6 +418,22 @@ def http_check(url: str) -> str:
         return f"url={url} status={e.code} elapsed_ms={ms:.1f} (HTTP error, host responded)"
     except Exception as e:
         ms = (time.perf_counter() - t0) * 1000
+        cause = e.reason if isinstance(e, urllib.error.URLError) else e
+        if isinstance(cause, ssl.SSLCertVerificationError):
+            # The first version reported this as "FAILED ... certificate has expired" for
+            # certificates that were valid, because the failure was in the local store. An
+            # instrument that cannot tell its own limitation from the thing it measures
+            # will be believed about the thing it measures.
+            alt = _schannel_check(url)
+            if alt and alt[1] == 0 and alt[0] > 0:
+                return (f"url={url} status={alt[0]} elapsed_ms={alt[2] * 1000:.1f} "
+                        f"(verified by Windows SChannel; this tool's own trust store could not "
+                        f"build the certificate chain - a local CA gap on THIS machine, not a "
+                        f"fault of the site. {cause})")
+            if alt:
+                return (f"url={url} FAILED after_ms={ms:.1f} (TLS verification failed in BOTH "
+                        f"this tool's trust store and Windows' - the certificate presented is "
+                        f"not trusted here. Interception, or a bad certificate. {cause})")
         return f"url={url} FAILED after_ms={ms:.1f} ({type(e).__name__}: {e})"
 
 

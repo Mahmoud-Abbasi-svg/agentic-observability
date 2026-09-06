@@ -81,6 +81,49 @@ def main() -> int:
     ok &= check("with no adapter information, no resolver override is attempted",
                 net_tools._active_resolvers() == [])
 
+    # http_check must never report its own trust store's gap as the site's fault. Live data:
+    # it said "certificate has expired" for cloudflare.com and wikipedia.org, both valid for
+    # months, because Python's OpenSSL could not build a Let's Encrypt chain from the Windows
+    # store that Windows itself could.
+    import ssl
+    import urllib.error
+    import urllib.request
+    real_urlopen = urllib.request.urlopen
+
+    def refuse(*_a, **_k):
+        raise urllib.error.URLError(ssl.SSLCertVerificationError(
+            "certificate verify failed: certificate has expired"))
+
+    urllib.request.urlopen = refuse
+    try:
+        net_tools._schannel_check = lambda url: (200, 0, 0.123)
+        out = net_tools.http_check("https://www.cloudflare.com")
+        ok &= check("a TLS failure that Windows verifies is reported as the site being UP, with "
+                    "the local CA gap named",
+                    "status=200" in out and "local CA gap" in out and "FAILED" not in out,
+                    out.splitlines()[0][:70])
+        net_tools._schannel_check = lambda url: (0, 20, 0.05)
+        out = net_tools.http_check("https://bad.example")
+        ok &= check("a TLS failure that Windows ALSO rejects is reported as untrusted, not as "
+                    "a store gap",
+                    "FAILED" in out and "not trusted here" in out and "local CA gap" not in out)
+        net_tools._schannel_check = lambda url: None
+        out = net_tools.http_check("https://x.example")
+        ok &= check("with no second opinion available, the failure is reported as-is, "
+                    "without a verdict either way",
+                    "FAILED" in out and "not trusted here" not in out
+                    and "local CA gap" not in out)
+    finally:
+        urllib.request.urlopen = real_urlopen
+
+    try:
+        import certifi                                                 # noqa: F401
+        n = net_tools._http_context().cert_store_stats()["x509_ca"]
+        ok &= check("the HTTP trust store carries certifi's bundle on top of the system's",
+                    n >= 100, f"{n} CAs")
+    except ImportError:
+        print("  skip  certifi not installed; the system store stands alone")
+
     print("\n" + ("ALL PASS" if ok else "FAILURES ABOVE"))
     return 0 if ok else 1
 
