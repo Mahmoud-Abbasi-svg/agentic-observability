@@ -126,6 +126,45 @@ def main() -> int:
     ok &= check("but the blip, which hit gw alone, does not count as the network",
                 every.split("down at once")[1].count("->") == 1)
 
+    # ---------------------------------------------------------------- the monitor moved
+    # A gap in THIS network's heartbeats is not evidence the monitor was down. Live data said
+    # "collector was not running - only 1 of ~587 expected cycles" for a stretch in which the
+    # collector ran 213 cycles on the office network. The laptop had moved, and every move
+    # empties one network's record while filling another's.
+    OTHER = "aaaaaaaaaaaa"
+    CONN.execute("INSERT OR REPLACE INTO net (net_id,label,gateway,gw_mac,ssid,subnet,"
+                 "first_seen,last_seen) VALUES (?,?,?,?,?,?,?,?)",
+                 (OTHER, "office-wifi", "10.0.0.1", "aa:bb", "office-wifi", "10.0.0.0/24",
+                  NOW - 20000, NOW))
+    # Heartbeats on the OTHER network across most of the sleep gap (minutes 170..70 back).
+    CONN.executemany("INSERT OR REPLACE INTO heartbeat (ts,net_id,n_ok,n_failed) "
+                     "VALUES (?,?,?,?)",
+                     [(NOW - m * STEP + 7, OTHER, 2, 0) for m in range(170, 69, -1)])
+    CONN.commit()
+
+    moved = net_memory.availability("gw", hours=6)
+    print("\n" + [l for l in moved.splitlines() if "NOT MEASURED" in l][-1] + "\n")
+    ok &= check("a gap covered by another network says the collector was ELSEWHERE, "
+                "not that it was down",
+                "was running on network 'office-wifi'" in moved
+                and "collector was not running" not in moved.split("33 consecutive")[1])
+    ok &= check("and it names how much of the gap that does NOT explain",
+                "unaccounted for" in moved,
+                [l for l in moved.splitlines() if "unaccounted" in l][0].strip()[-46:])
+    ok &= check("coverage gives the same correction, and counts the moves",
+                "on THIS network" in net_memory.coverage(hours=6)
+                and "not down, elsewhere" in net_memory.coverage(hours=6)
+                and "1 of them is the machine" in net_memory.coverage(hours=6))
+
+    # A stray beat or two on another network is the laptop brushing past it, not a move.
+    CONN.execute("DELETE FROM heartbeat WHERE net_id=?", (OTHER,))
+    CONN.executemany("INSERT OR REPLACE INTO heartbeat (ts,net_id,n_ok,n_failed) "
+                     "VALUES (?,?,?,?)", [(NOW - m * STEP + 7, OTHER, 2, 0) for m in (150, 140)])
+    CONN.commit()
+    ok &= check("two stray beats elsewhere are not a move, and the gap is still the monitor "
+                "being down",
+                "office-wifi" not in net_memory.availability("gw", hours=6))
+
     print("\n" + ("ALL PASS" if ok else "FAILURES ABOVE"))
     return 0 if ok else 1
 

@@ -794,15 +794,30 @@ def coverage(hours: float = 24.0, target: str = "") -> str:
            f"  {len(beats)} cycles, roughly every {cadence / 60:.1f} min",
            f"  covered {covered * 100:.0f}% of the period"]
     if gaps:
-        out.append(f"  {len(gaps)} gap(s) where NOTHING was measured:")
+        # Same correction as availability: a gap here is not proof the monitor was down. The
+        # laptop moves, and every move empties one network's record while filling another's.
+        other = _other_beats(since, net["net_id"])
+        out.append(f"  {len(gaps)} gap(s) where NOTHING was measured on THIS network:")
+        moved = 0
         for a, b in gaps[:8]:
+            el = _elsewhere(other, a, b)
+            note = ""
+            if el:
+                moved += 1
+                note = (f"  <- collector was running on {el[0]!r} "
+                        f"({el[3]} cycles); not down, elsewhere")
             out.append(f"    {time.strftime('%d %b %H:%M', time.localtime(a))} -> "
                        f"{time.strftime('%d %b %H:%M', time.localtime(b))}  "
-                       f"({(b - a) / 3600:.1f} h)")
+                       f"({(b - a) / 3600:.1f} h){note}")
         if len(gaps) > 8:
             out.append(f"    ... and {len(gaps) - 8} more")
         out.append("  Do not describe these periods as quiet or healthy. They were not "
-                   "observed, and that is a different statement.")
+                   "observed on this network, and that is a different statement.")
+        if moved:
+            out.append(f"  {moved} of them {'is' if moved == 1 else 'are'} the machine being "
+                       f"on another network, not the monitor being down - "
+                       f"{'that period was' if moved == 1 else 'those periods were'} "
+                       f"observed, just not here.")
     else:
         out.append("  no gaps - the period was observed continuously.")
 
@@ -842,8 +857,64 @@ def _fmt_dur(s: float) -> str:
     return f"{s / 60:.0f} min" if s < 5400 else f"{s / 3600:.1f} h"
 
 
+def _other_beats(since: float, net_id: str) -> list[tuple]:
+    """(ts, label) heartbeats from every OTHER network since `since`, oldest first.
+
+    Fetched once per question and sliced in Python: a gap is asked about several times, once
+    per target, and one query beats a query per gap per host.
+    """
+    return list(conn().execute(
+        "SELECT h.ts, COALESCE(n.label, h.net_id) FROM heartbeat h "
+        "LEFT JOIN net n ON n.net_id = h.net_id "
+        "WHERE h.ts >= ? AND h.net_id != ? ORDER BY h.ts", (since, net_id)))
+
+
+def _elsewhere(other: list[tuple], a: float, b: float,
+               min_beats: int = 3) -> Optional[tuple]:
+    """(label, first, last, n) for the other network most measured strictly inside (a, b).
+
+    This is what turns "the collector was not running" into "the collector was somewhere
+    else". A gap in THIS network's heartbeats is not evidence the monitor was down - the
+    laptop moves, and every move leaves one network's record empty while another fills. Only
+    heartbeats can distinguish the two, and they are per-network, so the question has to be
+    asked of the others explicitly.
+    """
+    seen: dict[str, list] = {}
+    for ts, label in other:
+        if a < ts < b:
+            e = seen.setdefault(label, [ts, ts, 0])
+            e[1], e[2] = ts, e[2] + 1
+    if not seen:
+        return None
+    label, (lo, hi, n) = max(seen.items(), key=lambda kv: kv[1][2])
+    return (label, lo, hi, n) if n >= min_beats else None
+
+
+def _gap_reason(r: dict, now: float) -> str:
+    """Why nothing was measured here - the monitor down, the monitor elsewhere, or this host
+    skipped while the monitor ran."""
+    running_here = not (r["beats"] == 0
+                        or (r["expected"] > 0 and r["beats"] / r["expected"] < 0.25))
+    if running_here:
+        return f"collector ran {r['beats']} cycles but did not probe this host"
+    el = r.get("elsewhere")
+    if el:
+        label, lo, hi, n = el
+        why = (f"collector was running on network {label!r} {_fmt_t(lo, now)} -> "
+               f"{_fmt_t(hi, now)} ({n} cycles), not on this one")
+        # Naming the other network must not quietly account for the whole gap when it covers
+        # only part of it. The unexplained remainder is still unobserved time.
+        rest = (r["end"] - r["start"]) - (hi - lo)
+        if rest > 0.2 * (r["end"] - r["start"]):
+            why += f"; the other {_fmt_dur(rest)} is unaccounted for"
+        return why
+    if r["beats"] == 0:
+        return "collector was not running"
+    return f"collector was not running - only {r['beats']} of ~{r['expected']:.0f} expected cycles"
+
+
 def _runs(rows: list[tuple], since: float, now: float, beats: list[int],
-          beat_cadence: float) -> list[dict]:
+          beat_cadence: float, other: Optional[list[tuple]] = None) -> list[dict]:
     """Cut an ordered (ts, reachable) series into contiguous runs of up / down / gap.
 
     A run ends where the next run begins, so the pieces tile the window: a DOWN run's end is
@@ -862,7 +933,8 @@ def _runs(rows: list[tuple], since: float, now: float, beats: list[int],
         # is true and misleading. One stray cycle in three hours is not a running collector.
         n_beats = sum(1 for t in beats if a < t < b)
         expected = (b - a) / beat_cadence if beat_cadence > 0 else 0.0
-        return dict(kind="gap", start=a, end=b, n=0, beats=n_beats, expected=expected)
+        return dict(kind="gap", start=a, end=b, n=0, beats=n_beats, expected=expected,
+                    elsewhere=_elsewhere(other or [], a, b))
 
     runs: list[dict] = []
     if rows[0][0] - since > threshold:
@@ -892,7 +964,9 @@ def _runs(rows: list[tuple], since: float, now: float, beats: list[int],
 
 
 def _availability_one(target: str, since: float, now: float, net: dict, beats: list[int],
-                      beat_cadence: float) -> tuple[str, list[tuple], list[tuple]]:
+                      beat_cadence: float,
+                      other: Optional[list[tuple]] = None) -> tuple[str, list[tuple],
+                                                                    list[tuple]]:
     """Text for one host, plus its DOWN intervals and its OBSERVED (up or down) intervals."""
     rows = list(conn().execute(
         "SELECT ts, value FROM sample WHERE target=? AND metric='reachable' AND net_id=? "
@@ -902,7 +976,7 @@ def _availability_one(target: str, since: float, now: float, net: dict, beats: l
         return (f"{head}: no reachability probes recorded. Use coverage to see whether "
                 f"anything at all was measured in this period."), [], []
 
-    runs = _runs(rows, since, now, beats, beat_cadence)
+    runs = _runs(rows, since, now, beats, beat_cadence, other)
     out = [f"{head}: {len(rows)} probes"]
     down_ivs: list[tuple[float, float]] = []
     seen_ivs: list[tuple[float, float]] = []
@@ -910,14 +984,7 @@ def _availability_one(target: str, since: float, now: float, net: dict, beats: l
         span = f"  {_fmt_t(r['start'], now)} -> {_fmt_t(r['end'], now)}"
         dur = _fmt_dur(r["end"] - r["start"])
         if r["kind"] == "gap":
-            if r["beats"] == 0:
-                why = "collector was not running"
-            elif r["expected"] > 0 and r["beats"] / r["expected"] < 0.25:
-                why = (f"collector was not running - only {r['beats']} of ~{r['expected']:.0f} "
-                       f"expected cycles")
-            else:
-                why = f"collector ran {r['beats']} cycles but did not probe this host"
-            out.append(f"{span}   NOT MEASURED  {dur:>8}   ({why})")
+            out.append(f"{span}   NOT MEASURED  {dur:>8}   ({_gap_reason(r, now)})")
             continue
         seen_ivs.append((r["start"], r["end"]))
         if r["kind"] == "down":
@@ -1020,9 +1087,10 @@ def availability(target: str = "", hours: float = 24.0) -> str:
         (net["net_id"], since))]
     bdiffs = [b - a for a, b in zip(beats, beats[1:]) if b > a]
     beat_cadence = statistics.median(bdiffs) if bdiffs else 0.0
+    other = _other_beats(since, net["net_id"])
 
     if target:
-        return _availability_one(target, since, now, net, beats, beat_cadence)[0]
+        return _availability_one(target, since, now, net, beats, beat_cadence, other)[0]
 
     counts = list(conn().execute(
         "SELECT target, COUNT(*) FROM sample WHERE net_id=? AND metric='reachable' AND ts>=? "
@@ -1037,7 +1105,7 @@ def availability(target: str = "", hours: float = 24.0) -> str:
     sparse = [t for t, n in counts if n < 3]
     parts, down, seen = [], {}, {}
     for t in monitored:
-        text, d_ivs, s_ivs = _availability_one(t, since, now, net, beats, beat_cadence)
+        text, d_ivs, s_ivs = _availability_one(t, since, now, net, beats, beat_cadence, other)
         parts.append(text)
         down[t], seen[t] = d_ivs, s_ivs
     if sparse:

@@ -295,6 +295,20 @@ Three things in that output were each got wrong once before they were got right:
 - **A gap is judged against the expected cycle count, not against zero.** The heartbeat for
   the last cycle before sleep lands seconds after its samples, inside the gap, and a three-hour
   sleep came out as "collector ran 1 cycle". True, and misleading.
+- **A gap on this network is not evidence the monitor was down.** It reported *"collector was
+  not running — only 1 of ~587 expected cycles"* for a stretch in which the collector ran
+  **213 cycles on the office network**. Heartbeats are per-network, so a laptop that moves
+  empties one record while filling another. Both tools now ask the other networks before
+  blaming the collector, and name the part of the gap that still is not explained:
+
+  ```
+  07 Sep 12:11 -> 08 Sep 00:02   NOT MEASURED   11.9 h   (collector was running on network
+  'AirInstitute' 07 Sep 12:12 -> 07 Sep 16:58 (342 cycles), not on this one; the other 7.1 h
+  is unaccounted for)
+  ```
+
+  The 7.1 h is the machine asleep, and it stays unclaimed. Fewer than three heartbeats
+  elsewhere is the laptop brushing past a network, not a move, and does not excuse a gap.
 
 ## The monitor
 
