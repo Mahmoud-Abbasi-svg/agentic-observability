@@ -59,8 +59,14 @@ SCENARIOS = [
 
     dict(id="port_closed", category="FAULT",
          question="Why can't I connect to example.com on port 9999?",
-         expect="The HOST is reachable but nothing is listening on port 9999. Saying the host "
-                "is down or unreachable is WRONG - that is the whole point of this scenario.",
+         expect="The HOST is reachable (it serves 443) and port 9999 does not accept "
+                "connections. Saying the host is down or unreachable is WRONG - that is the "
+                "whole point. A correct answer also says WHICH kind of failure 9999 gives: a "
+                "refusal means nothing is listening there; silence (a timeout) means either a "
+                "firewall or nothing listening, which cannot be told apart from here - and the "
+                "agent should not pick one. If the name does not resolve on this network, the "
+                "port was never tested and the answer must say so instead of describing the "
+                "port.",
          must_not=[r"\bhost is (down|unreachable)\b", r"\bexample\.com is (down|unreachable)\b"],
          want_tools={"check_port", "tcp_latency"}),
 

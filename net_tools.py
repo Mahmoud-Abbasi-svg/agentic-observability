@@ -140,15 +140,25 @@ def tcp_latency(host: str, port: int = 443, attempts: int = 5) -> str:
             with socket.create_connection((host, port), timeout=5.0):
                 times.append((time.perf_counter() - t0) * 1000.0)
         except Exception as e:
-            errors.append(f"{type(e).__name__}: {e}")
+            errors.append(e)
     out = [f"host={host} port={port} attempts={attempts} "
            f"succeeded={len(times)} failed={len(errors)}"]
     if times:
         out.append(f"handshake_ms: min={min(times):.1f} avg={sum(times)/len(times):.1f} "
                    f"max={max(times):.1f}")
     if errors:
-        uniq = sorted(set(errors))
-        out.append("errors: " + "; ".join(uniq[:3]))
+        # Say what KIND of failure, not just that there were failures. "failed=5" with a
+        # timeout and "failed=5" with a refusal are opposite findings about the host.
+        kinds: dict[str, tuple[int, str]] = {}
+        for e in errors:
+            label, meaning = _connect_failure(e)
+            n, _m = kinds.get(label, (0, meaning))
+            kinds[label] = (n + 1, meaning)
+        out.append("failures: " + ", ".join(f"{k} x{n}" for k, (n, _m) in kinds.items()))
+        for k, (_n, meaning) in kinds.items():
+            out.append(f"  {k}: {meaning}")
+        uniq = sorted({f"{type(e).__name__}: {e}" for e in errors})
+        out.append("raw errors: " + "; ".join(uniq[:3]))
     return "\n".join(out)
 
 
@@ -308,11 +318,40 @@ def dns_query_server(server: str, name: str = "example.com", record_type: str = 
             f"rcode={rcode} elapsed_ms={ms:.1f}\n" + "\n".join(answers[:10]))
 
 
+def _connect_failure(e: Exception) -> tuple[str, str]:
+    """(label, meaning) for a failed TCP connect. Three outcomes, and they mean OPPOSITE things.
+
+    Until this existed, check_port reported every one of them as CLOSED_OR_FILTERED with the
+    exception name in parentheses - so a refusal (the host is alive and said no), a timeout
+    (a firewall dropped it, or the host is gone; indistinguishable from here) and a name that
+    never resolved (the port was never tested at all) all carried the same verdict. On a
+    hotspot whose resolver refuses example.com, "check_port example.com 9999" answered
+    CLOSED_OR_FILTERED: a DNS failure reported as a port status. Same shape as dns_lookup and
+    http_check - the instrument's own limitation, presented as a fact about the target.
+    """
+    if isinstance(e, socket.gaierror):
+        return "UNRESOLVED", ("the name did not resolve, so the port was never tested; this "
+                              "says nothing about the port or the host. Resolve the name "
+                              "first (dns_lookup, dns_query_server)")
+    if isinstance(e, (ConnectionRefusedError, ConnectionResetError)):
+        return "REFUSED", ("the host is UP and answered - nothing is listening on this port, "
+                           "or something there rejects connections")
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return "NO_ANSWER", ("no reply at all. Either a firewall silently drops this port, or "
+                             "the host is unreachable - those cannot be told apart from here. "
+                             "Test a port the host is known to serve to separate them")
+    return "UNREACHABLE", f"failed below TCP, at the network layer ({type(e).__name__})"
+
+
 def check_port(host: str, port: int) -> str:
     """Check whether a single TCP port accepts a connection, and read any banner offered.
 
     Use this to confirm a specific service is listening, as opposed to the host merely being
     up. One port per call - this is a diagnostic, not a scanner.
+
+    A failure is one of four things and the result says which, because they mean different
+    things: REFUSED proves the host is up; NO_ANSWER cannot distinguish a firewall from a dead
+    host; UNRESOLVED means the port was never tested; UNREACHABLE is a routing failure.
 
     Args:
         host: Hostname or IP address.
@@ -336,7 +375,9 @@ def check_port(host: str, port: int) -> str:
                     + (f"\nbanner: {banner[:200]}" if banner else ""))
     except Exception as e:
         ms = (time.perf_counter() - t0) * 1000
-        return f"host={host} port={port} CLOSED_OR_FILTERED after_ms={ms:.1f} ({type(e).__name__}: {e})"
+        label, meaning = _connect_failure(e)
+        return (f"host={host} port={port} {label} after_ms={ms:.1f}\n"
+                f"  {meaning} ({type(e).__name__}: {e})")
 
 
 def _http_context():

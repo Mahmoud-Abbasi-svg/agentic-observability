@@ -144,6 +144,13 @@ def cycle(conn, cfg: dict, due: list[dict], workers: int = 4, verbose: bool = Tr
             net_store.add_samples(conn, host, real, net["net_id"])
         if err:
             n_broken += 1                      # a broken probe, recorded nowhere
+        elif not real:
+            # The probe ran but established nothing - a name that did not resolve, so the
+            # host was never contacted. Neither ok nor failed: counting it as ok (which the
+            # reachable default did) inflates the heartbeat's success count on a network
+            # that refuses one name, and counting it as failed writes an outage that was
+            # never observed.
+            n_broken += 1
         elif real.get("reachable", 1.0):
             n_ok += 1
         else:
@@ -151,7 +158,8 @@ def cycle(conn, cfg: dict, due: list[dict], workers: int = 4, verbose: bool = Tr
         if verbose:
             shown = (f"PROBE ERROR: {err}" if err
                      else ", ".join(f"{k}={v:g}" for k, v in sorted(real.items()))
-                     or "(no metrics parsed)")
+                     or "(nothing recorded - the probe could not reach the point of "
+                        "measuring, e.g. the name did not resolve)")
             print(f"  {name:<16} {host:<22} {shown}")
     if n_broken and verbose:
         print(f"  {n_broken} probe(s) errored - not recorded, fix the config or the tool")

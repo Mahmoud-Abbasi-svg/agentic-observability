@@ -100,6 +100,13 @@ def extract_metrics(tool: str, text: str) -> dict[str, float]:
             v = _f(pat, text)
             if v is not None:
                 m[k] = v
+        # A name that never resolved was never connected to. Storing reachable=0 for it
+        # writes "the host was down" into the availability history on the strength of a DNS
+        # failure - which on a hotspot that refuses one name means a permanently-down host
+        # that was never once probed. Say nothing about reachability; the dns probes carry
+        # the resolution failure on their own.
+        if ok == 0 and re.search(r"^failures: UNRESOLVED x\d+$", text, re.M):
+            return m
         if ok is not None and failed is not None and (ok + failed) > 0:
             m["success_rate"] = ok / (ok + failed)
         m["reachable"] = 1.0 if "handshake_avg_ms" in m else 0.0
@@ -114,13 +121,19 @@ def extract_metrics(tool: str, text: str) -> dict[str, float]:
             m["query_ms"] = v
         m["reachable"] = 1.0 if v is not None and "NOERROR" in text else 0.0
     elif tool == "check_port":
-        if "OPEN" in text:
+        # The verdict is the third token of the first line, not a substring of the whole
+        # text - the explanatory lines below it now mention other labels.
+        head = re.match(r"host=\S+ port=\d+ (\w+)", text or "")
+        label = head.group(1) if head else ""
+        if label == "OPEN":
             v = _f(r"connect_ms=([0-9.]+)", text)
             if v is not None:
                 m["connect_ms"] = v
             m["open"] = 1.0
-        else:
-            m["open"] = 0.0
+        elif label == "UNRESOLVED":
+            pass                    # never tested: nothing to record about the port
+        elif label:
+            m["open"] = 0.0         # REFUSED, NO_ANSWER, UNREACHABLE, or the old CLOSED_OR_FILTERED
     elif tool == "http_check":
         st, el = _f(r"status=([0-9]+)", text), _f(r"elapsed_ms=([0-9.]+)", text)
         if st is not None:

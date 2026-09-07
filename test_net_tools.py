@@ -122,6 +122,58 @@ def main() -> int:
     finally:
         urllib.request.urlopen = real_urlopen
 
+    # check_port and tcp_latency must say WHICH kind of failure, because the three kinds mean
+    # opposite things. Live, on the hotspot: 127.0.0.1:9 (refused - host up), 1.1.1.1:9999
+    # (timeout - undecidable) and example.com:9999 (name refused by the resolver - port never
+    # tested) all came back CLOSED_OR_FILTERED. A DNS failure reported as a port status.
+    import socket as _socket
+    real_connect = _socket.create_connection
+    cases = [
+        (ConnectionRefusedError(10061, "actively refused"), "REFUSED", "host is UP"),
+        (TimeoutError("timed out"), "NO_ANSWER", "cannot be told apart"),
+        (_socket.gaierror(11001, "getaddrinfo failed"), "UNRESOLVED", "never tested"),
+        (OSError(10065, "no route to host"), "UNREACHABLE", "network layer"),
+    ]
+    try:
+        for exc, label, phrase in cases:
+            def raiser(*_a, _exc=exc, **_k):
+                raise _exc
+            _socket.create_connection = raiser
+            out = net_tools.check_port("h.example", 9)
+            ok &= check(f"check_port names a {label} and says what it means",
+                        f" {label} " in out.splitlines()[0] and phrase in out
+                        and "CLOSED_OR_FILTERED" not in out,
+                        out.splitlines()[0][:60])
+        _socket.create_connection = lambda *a, **k: (_ for _ in ()).throw(TimeoutError("t"))
+        out = net_tools.tcp_latency("h.example", 443, attempts=3)
+        ok &= check("tcp_latency keeps its parseable first line and classifies the failures",
+                    out.splitlines()[0] == "host=h.example port=443 attempts=3 succeeded=0 "
+                    "failed=3" and "NO_ANSWER x3" in out and "cannot be told apart" in out)
+
+        # And what the STORE makes of each. A failure that never reached the port must not
+        # become "the port was closed" or "the host was down" in the availability history.
+        import net_memory
+        em = net_memory.extract_metrics
+        _socket.create_connection = lambda *a, **k: (_ for _ in ()).throw(
+            _socket.gaierror(11001, "getaddrinfo failed"))
+        ok &= check("an UNRESOLVED check_port records nothing about the port",
+                    "open" not in em("check_port", net_tools.check_port("h.example", 9)))
+        ok &= check("an all-UNRESOLVED tcp_latency records neither reachable nor success_rate",
+                    not {"reachable", "success_rate"}
+                    & set(em("tcp_latency", net_tools.tcp_latency("h.example", 443, 2))))
+        _socket.create_connection = lambda *a, **k: (_ for _ in ()).throw(
+            ConnectionRefusedError(10061, "refused"))
+        ok &= check("a REFUSED check_port records open=0 - the port really was tested",
+                    em("check_port", net_tools.check_port("h.example", 9)).get("open") == 0.0)
+        ok &= check("a REFUSED tcp_latency records reachable=0 and success_rate=0",
+                    em("tcp_latency", net_tools.tcp_latency("h.example", 443, 2))
+                    == {"success_rate": 0.0, "reachable": 0.0})
+        ok &= check("the old CLOSED_OR_FILTERED text still parses as open=0",
+                    em("check_port", "host=x port=9 CLOSED_OR_FILTERED after_ms=1.0 (x)")
+                    .get("open") == 0.0)
+    finally:
+        _socket.create_connection = real_connect
+
     try:
         import certifi                                                 # noqa: F401
         n = net_tools._http_context().cert_store_stats()["x509_ca"]
