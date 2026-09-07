@@ -194,6 +194,23 @@ def main() -> int:
                 "all read as measurements" not in net_verify.format_report(
                     net_verify.verify("RTT to quiet-path is 13.8 ms.")))
 
+    # --- "resolution" is what the instrument has, not what DNS does ----------------------
+    # Live: "**Resolution.** This history can only resolve shifts of about 35% or larger.
+    # Tonight's -41% clears that bar" was checked against the DNS query floor, because the
+    # word list mapped "resolution" to query_ms. The prompt teaches the agent that word in
+    # the instrument sense, so the verifier was contradicting its own vocabulary.
+    f = net_verify.verify("Latency to quiet-path is down. Resolution: this history can only "
+                          "resolve shifts of about 35% or larger. Tonight's -41% clears that "
+                          "bar.")["findings"]
+    ok &= check("'resolution' in the instrument sense does not switch the metric to DNS",
+                f and all(x.claim.metric == "rtt_avg_ms" for x in f),
+                f"metrics {[x.claim.metric for x in f]}")
+    f = net_verify.verify("Name resolution at quiet-path slowed 30%.")["findings"]
+    g = net_verify.verify("quiet-path resolves the name 30% slower.")["findings"]
+    ok &= check("resolution bound to a NAME still means the DNS metric",
+                f and f[0].claim.metric == "query_ms" and g and g[0].claim.metric == "query_ms",
+                f"{[x.claim.metric for x in f + g]}")
+
     # --- refuted claims are agreement, not contradiction -----------------------------------
     # Found on the first change-question answer: the agent wrote "a 5% increase would be
     # completely undetectable here", which says exactly what the floor says, and the verifier

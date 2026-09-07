@@ -55,8 +55,10 @@ import net_store
 
 # Words that turn a number into an assertion about a DIFFERENCE. Without one of these (or an
 # explicit sign) a number is treated as a reading and left alone.
-RISE = r"rose|rise|risen|up|increased?|climbed|grew|jumped|higher|worse|worsened|degraded|slower"
-FALL = r"fell|fall|fallen|down|decreased?|dropped|declined|shrank|lower|better|improved|faster"
+RISE = (r"rose|rise|risen|up|increased?|climbed|grew|jumped|higher|worse|worsened|degraded|"
+        r"slower|slowed")
+FALL = (r"fell|fall|fallen|down|decreased?|dropped|declined|shrank|lower|better|improved|"
+        r"faster|sped up")
 CHANGE = rf"{RISE}|{FALL}|changed|shifted|moved|differs?|deviated"
 
 # Which stored metric a phrase is talking about. Order matters: the first match wins, so the
@@ -64,7 +66,13 @@ CHANGE = rf"{RISE}|{FALL}|changed|shifted|moved|differs?|deviated"
 METRIC_WORDS = [
     (r"handshake", "handshake_avg_ms"),
     (r"\bconnect(?:ion)? time\b|\bconnect_ms\b", "connect_ms"),
-    (r"\bdns\b|resolver|resolution|\bquery\b|lookup", "query_ms"),
+    # "resolution" is NOT a DNS word here. The system prompt teaches the agent to say it in
+    # the instrument sense ("this history can only resolve shifts of about 35%"), and the
+    # first version of this line read that as name resolution: a live answer's "-41%" was
+    # checked against the DNS floor because the heading before it said "Resolution." Only
+    # words that bind resolution to a NAME count.
+    (r"\bdns\b|resolver|\bname resol\w*|resolv\w* (?:the |a |its )?(?:name|hostname|domain)"
+     r"|\bquery\b|lookup", "query_ms"),
     (r"http|response time|page load|\bttfb\b", "response_ms"),
     (r"packet loss|\bloss\b|dropped packets", "loss_pct"),
     (r"reachab|availab|uptime|packet delivery", "reachable"),
