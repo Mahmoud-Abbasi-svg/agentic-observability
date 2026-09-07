@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import re
 import statistics
+import threading
 import time
 from typing import Any, Optional
 
@@ -133,14 +134,31 @@ def extract_metrics(tool: str, text: str) -> dict[str, float]:
 
 # --------------------------------------------------------------------------- storage
 
-_CONN = None
+_LOCAL = threading.local()
 
 
 def conn():
-    global _CONN
-    if _CONN is None:
-        _CONN = net_store.connect()
-    return _CONN
+    """One connection per thread, because sqlite3 forbids sharing one across threads.
+
+    This was a single module-level connection, and the second thread to ask for history got
+    "SQLite objects created in a thread can only be used in that same thread" - so every
+    baseline, coverage, detect_change and availability call in it failed. net_eval runs
+    scenarios concurrently, which means THE HARNESS THAT MEASURES THE AGENT was breaking the
+    agent's access to its own history, and scenarios were being scored on answers given
+    without the history they should have had. A suite that damages what it measures reports
+    the damage as the subject's fault.
+
+    Found by the agent, in an eval run, which noted "baseline and availability both crashed
+    with a SQLite cross-thread error ... that's a tool bug on this machine, worth fixing" -
+    and then correctly declined to draw conclusions from the history it could not read.
+
+    WAL mode makes several connections to one file the normal arrangement, so this costs a
+    file handle per thread and nothing else.
+    """
+    c = getattr(_LOCAL, "conn", None)
+    if c is None:
+        c = _LOCAL.conn = net_store.connect()
+    return c
 
 
 def record(tool: str, args: dict, output: str) -> None:

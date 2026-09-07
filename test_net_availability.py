@@ -165,6 +165,32 @@ def main() -> int:
                 "being down",
                 "office-wifi" not in net_memory.availability("gw", hours=6))
 
+    # ---------------------------------------------------------------- read from a thread
+    # net_eval runs scenarios concurrently and net_memory cached ONE sqlite connection, so the
+    # second thread to ask for history got "SQLite objects created in a thread can only be
+    # used in that same thread" and every baseline/coverage/availability call in it failed.
+    # The harness that measures the agent was breaking the agent's access to its own history.
+    import threading
+    errs: list[str] = []
+
+    def in_thread() -> None:
+        try:
+            for call in (lambda: net_memory.availability("gw", hours=6),
+                         lambda: net_memory.coverage(hours=6),
+                         lambda: net_memory.baseline("gw", "reachable", days=1),
+                         lambda: net_memory.detect_change("gw", "reachable")):
+                call()
+        except Exception as e:                                       # noqa: BLE001
+            errs.append(f"{type(e).__name__}: {e}")
+
+    ts = [threading.Thread(target=in_thread) for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    ok &= check("history reads work from other threads, as the eval harness makes them",
+                not errs, errs[0][:70] if errs else "3 threads, 4 calls each")
+
     print("\n" + ("ALL PASS" if ok else "FAILURES ABOVE"))
     return 0 if ok else 1
 
