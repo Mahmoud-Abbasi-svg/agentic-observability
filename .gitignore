@@ -26,6 +26,9 @@ net_eval_stopping.json
 # database is kept out of the repo for. net_eval_results*.json alone did not match a --save
 # under any other name.
 eval_*.json
+# The rendered report. It quotes the SSID, the gateway and this machine's addresses by
+# design - that is what makes it useful and what keeps it out of the repo.
+net_report.html
 
 # Local configuration: may name internal hosts. monitor.example.json is tracked.
 monitor.json

@@ -103,7 +103,13 @@ def build(conn, net_id: str, now: float) -> None:
     print(f"built {len(rows)} samples across 4 paths, 9 h ending now")
 
 
-def check(name: str, ok: bool, detail: str = "") -> bool:
+def check(name: str, ok, detail: str = "") -> bool:
+    # bool(), not the value: callers pass expressions like `a and b and c`, which
+    # yield the last truthy operand rather than True. Suites accumulate with
+    # `ok &= check(...)`, and `True & 6` is 0 - so every check printed PASS while the
+    # suite reported failure. It can only raise a false alarm, never hide a real one,
+    # but a suite that cries wolf gets ignored like any other.
+    ok = bool(ok)
     print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"   {detail}" if detail else ""))
     return ok
 

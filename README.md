@@ -322,6 +322,34 @@ Three things in that output were each got wrong once before they were got right:
 
   Found by an eval run, one day after shipping the fix it corrects.
 
+### `net_report.py` — the two things prose hides
+
+```
+python net_report.py --hours 48 --open
+```
+
+One self-contained HTML file, generated from the database. No server, no live connection, no
+state of its own — a report, not an interface. It exists for exactly two things that are hard
+to see in text:
+
+**Shape.** A contiguous hour of failure and sixty scattered failures produce the same summary
+(*"p95 loss 100%"*) and look nothing alike on a timeline. The agent made that mistake on a
+real outage before `availability` existed.
+
+**Freshness.** An alert holds its state when there is no new evidence, which is correct — but
+`ALERTING` with no date beside it reads as *alerting now*. One in this database had been
+frozen for 31 hours on a network the machine had left, and nothing anywhere said so. The
+report puts the age and the network next to every held state, and flags the stale ones.
+
+The design rule is the colour rule: **measured-good, measured-bad and NOT MEASURED are three
+states, never two.** Unobserved time is hatched, never green, because the fastest way for a
+picture to lie is to draw a gap the same colour as a quiet period. A fourth shade separates
+*"not measured here — the collector was on another network"* from *"not measured anywhere"*.
+
+The output is local by design: it quotes the SSID, the gateway and this machine's addresses,
+which is what makes it useful and why `net_report.html` is in `.gitignore`. Publishing it
+would leak exactly what keeping the database out of the repo protects.
+
 ## The monitor
 
 ```
