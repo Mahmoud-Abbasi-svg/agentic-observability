@@ -88,6 +88,14 @@ CREATE TABLE IF NOT EXISTS alert_state (
     streak     INTEGER NOT NULL,     -- consecutive confirmations in the current direction
     last_shift REAL,
     updated    INTEGER NOT NULL,
+    -- When the current excursion began, and the largest shift seen during it. Both exist
+    -- because of a real 3.5 h outage that CLEARED itself after 1.2 h: its own samples flowed
+    -- into the baseline the noise floor is calibrated on, the floor rose from 80 to 100, and
+    -- a +100 shift stopped "exceeding" it. anomaly_since keeps the excursion out of its own
+    -- baseline; peak_shift is what a recovery has to be measured against, so a floor that
+    -- grows can never be mistaken for a signal that receded.
+    anomaly_since INTEGER,
+    peak_shift    REAL,
     PRIMARY KEY (target, metric, net_id)
 );
 
@@ -145,16 +153,33 @@ def _migrate(conn: sqlite3.Connection) -> None:
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(sample_hourly)")}
         pending = [(o, n) for o, n in _HOURLY_RENAMES if o in cols and n not in cols]
-        if not pending:
+        state_cols = {r[1] for r in conn.execute("PRAGMA table_info(alert_state)")}
+        adds = [(n, t) for n, t in (("anomaly_since", "INTEGER"), ("peak_shift", "REAL"))
+                if n not in state_cols]
+        if not pending and not adds:
             return
         for old, new in pending:
             conn.execute(f"ALTER TABLE sample_hourly RENAME COLUMN {old} TO {new}")
+        for name, typ in adds:
+            conn.execute(f"ALTER TABLE alert_state ADD COLUMN {name} {typ}")
         conn.commit()
     except sqlite3.Error:
         try:
             conn.rollback()
         except sqlite3.Error:
             pass
+
+
+def has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Whether a column exists right now, since the migration above is allowed to fail.
+
+    Readers ask rather than assume: a database that was locked when its writer started still
+    has to answer correctly, with the older behaviour, instead of raising "no such column".
+    """
+    try:
+        return any(r[1] == column for r in conn.execute(f"PRAGMA table_info({table})"))
+    except sqlite3.Error:
+        return False
 
 
 def hourly_cols(conn: sqlite3.Connection) -> tuple[str, str, str]:

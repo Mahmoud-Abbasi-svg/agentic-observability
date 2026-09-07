@@ -114,17 +114,37 @@ CONFIG_PATH = os.environ.get(
 
 # --------------------------------------------------------------------------- state
 
+def _excursion_cols(conn: sqlite3.Connection) -> bool:
+    """Whether this database has the excursion columns yet - the migration may not have run."""
+    return net_store.has_column(conn, "alert_state", "anomaly_since")
+
+
 def get_state(conn: sqlite3.Connection, target: str, metric: str, net_id: str) -> dict:
-    row = conn.execute("SELECT state, since, streak, last_shift FROM alert_state "
+    extra = ", anomaly_since, peak_shift" if _excursion_cols(conn) else ""
+    row = conn.execute(f"SELECT state, since, streak, last_shift{extra} FROM alert_state "
                        "WHERE target=? AND metric=? AND net_id=?",
                        (target, metric, net_id)).fetchone()
     if not row:
-        return dict(state="UNKNOWN", since=int(time.time()), streak=0, last_shift=None)
-    return dict(state=row[0], since=row[1], streak=row[2], last_shift=row[3])
+        return dict(state="UNKNOWN", since=int(time.time()), streak=0, last_shift=None,
+                    anomaly_since=None, peak_shift=None)
+    return dict(state=row[0], since=row[1], streak=row[2], last_shift=row[3],
+                anomaly_since=row[4] if extra else None,
+                peak_shift=row[5] if extra else None)
 
 
 def put_state(conn: sqlite3.Connection, target: str, metric: str, net_id: str,
               st: dict, now: int) -> None:
+    if _excursion_cols(conn):
+        conn.execute(
+            "INSERT INTO alert_state (target,metric,net_id,state,since,streak,last_shift,"
+            "updated,anomaly_since,peak_shift) VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(target,metric,net_id) DO UPDATE SET state=excluded.state, "
+            "since=excluded.since, streak=excluded.streak, last_shift=excluded.last_shift, "
+            "updated=excluded.updated, anomaly_since=excluded.anomaly_since, "
+            "peak_shift=excluded.peak_shift",
+            (target, metric, net_id, st["state"], st["since"], st["streak"],
+             st.get("last_shift"), now, st.get("anomaly_since"), st.get("peak_shift")))
+        return
     conn.execute(
         "INSERT INTO alert_state (target,metric,net_id,state,since,streak,last_shift,updated) "
         "VALUES (?,?,?,?,?,?,?,?) "
@@ -133,6 +153,36 @@ def put_state(conn: sqlite3.Connection, target: str, metric: str, net_id: str,
         "updated=excluded.updated",
         (target, metric, net_id, st["state"], st["since"], st["streak"],
          st.get("last_shift"), now))
+
+
+# A recovery has to be a shift that receded, not a floor that grew. Below this fraction of the
+# largest shift seen during the excursion, "within the floor" counts as evidence of recovery;
+# at or above it, the signal has not moved and the alert is held whatever the floor says.
+RECOVERY_FRACTION = 0.5
+
+
+def recovery_is_real(shift: Optional[float], peak: Optional[float]) -> tuple[bool, str]:
+    """Does falling inside the noise floor mean the signal recovered? Pure, so it is testable.
+
+    On 2026-09-07 a 3.5 h outage cleared itself after 1.2 h. Nothing recovered: the outage's
+    own 100%-loss samples had entered the baseline the floor is calibrated from, placebo
+    windows began landing inside the outage, and the floor rose from 80 to 100 until a +100
+    shift no longer exceeded it. The evidence lines were honest throughout - the CLEAR entry
+    said "even 200% would not clear the noise floor" - but the verdict was labelled CLEAR,
+    which an operator reads as "recovered".
+
+    So a clear now requires the shift itself to have come down. A floor that grows past an
+    undiminished signal means the opposite of recovery: the event has lasted long enough to be
+    mistaken for this path's normal behaviour.
+    """
+    if peak is None or shift is None or abs(peak) < 1e-12:
+        return True, ""
+    same_direction = shift * peak > 0
+    if same_direction and abs(shift) >= RECOVERY_FRACTION * abs(peak):
+        return False, (f"HELD: still {abs(shift) * 100:.0f}% against a peak of "
+                       f"{abs(peak) * 100:.0f}% - within the floor only because the floor "
+                       f"grew. Still anomalous, no longer resolvable.")
+    return True, ""
 
 
 # --------------------------------------------------------------------------- notification
@@ -321,7 +371,10 @@ def evaluate(conn: sqlite3.Connection, webhook: str = "", now: Optional[float] =
             out.append(row)
             continue
 
-        r = net_memory.assess(target, metric, RECENT_HOURS, BASELINE_DAYS, now=now)
+        # An excursion must not be part of the baseline its own floor is calibrated on.
+        active = st["state"] in ("SUSPECT", "ALERTING", "RECOVERING")
+        r = net_memory.assess(target, metric, RECENT_HOURS, BASELINE_DAYS, now=now,
+                              baseline_before=st.get("anomaly_since") if active else None)
         if r["status"] != "ok":
             # No evidence this round. The state is held, but the confirmation chain is broken -
             # three confirmations must be three in a row, not three whenever they happen.
@@ -335,16 +388,37 @@ def evaluate(conn: sqlite3.Connection, webhook: str = "", now: Optional[float] =
             continue
 
         pages, why_not = worth_alerting(r)
+        held = ""
+        if not pages and st["state"] in ("ALERTING", "RECOVERING"):
+            recovered, held = recovery_is_real(r["shift"], st.get("peak_shift"))
+            if not recovered:
+                pages = True            # hold; walking toward CLEAR would be a false all-clear
+
         new_state, new_streak, event = step(st["state"], st["streak"], pages)
         since = inow if new_state != st["state"] else st["since"]
-        new = dict(state=new_state, since=since, streak=new_streak, last_shift=r["shift"])
+        # The excursion is bounded by the states, not by the alert: it opens when the signal
+        # first steps out of OK and closes only on a real return to it. anomaly_since reaches
+        # back over the recent window, because the shift was already under way for some of it.
+        was_active = st["state"] in ("SUSPECT", "ALERTING", "RECOVERING")
+        if new_state in ("SUSPECT", "ALERTING", "RECOVERING"):
+            anomaly_since = st.get("anomaly_since") if was_active else \
+                int(now - RECENT_HOURS * 3600)
+            peak = st.get("peak_shift") if was_active else None
+            if peak is None or abs(r["shift"]) > abs(peak):
+                peak = r["shift"]
+        else:
+            anomaly_since, peak = None, None
+        new = dict(state=new_state, since=since, streak=new_streak, last_shift=r["shift"],
+                   anomaly_since=anomaly_since, peak_shift=peak)
         put_state(conn, target, metric, net["net_id"], new, inow)
 
         row.update(state=new_state, streak=new_streak, shift=r["shift"],
                    relative=r["relative"], floor=r["noise_floor"], mde=r["mde"])
         # A real shift that is deliberately not paged says WHY. Otherwise the monitor looks
         # like it missed something, and an operator who thinks that stops trusting the silence.
-        if why_not:
+        if held:
+            row["note"] = held
+        elif why_not:
             row["note"] = why_not
         elif r["mde"] is not None and r["mde"] > MIN_PRACTICAL_SHIFT:
             # Under-instrumented: the goal asks for a resolution this history cannot deliver.

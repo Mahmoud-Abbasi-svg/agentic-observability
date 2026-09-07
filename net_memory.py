@@ -379,7 +379,8 @@ def _null_deviations(values: list[float], k: int) -> tuple[list[float], float, b
 
 
 def assess(target: str, metric: str = "rtt_avg_ms", recent_hours: float = 2.0,
-           baseline_days: float = 7.0, now: Optional[float] = None) -> dict:
+           baseline_days: float = 7.0, now: Optional[float] = None,
+           baseline_before: Optional[float] = None) -> dict:
     """The statistics behind detect_change, as numbers rather than prose.
 
     This exists so the agent's answer and the monitor's alert are computed ONCE. Two
@@ -392,6 +393,15 @@ def assess(target: str, metric: str = "rtt_avg_ms", recent_hours: float = 2.0,
       "ok"           - `exceeds` is the verdict, with the evidence that produced it
 
     `now` is injectable so the behaviour can be tested against constructed history.
+
+    `baseline_before` excludes everything from that timestamp onward from the BASELINE (the
+    recent window is untouched). An ongoing excursion otherwise flows into the history its own
+    noise floor is calibrated on: a real 3.5 h outage put 100%-loss samples into its baseline
+    until placebo windows started landing inside the outage, the floor rose from 80 to 100,
+    and a +100 shift stopped exceeding it. The alert cleared after 1.2 h while the network
+    stayed down for another 2.3. The caller that knows when the excursion began passes that
+    here; if too little clean history remains to calibrate on, the full baseline is used and
+    `baseline_contaminated` says so rather than the window silently shrinking.
     """
     now = time.time() if now is None else now
     rows, net = _rows(target, baseline_days, metric)
@@ -418,7 +428,19 @@ def assess(target: str, metric: str = "rtt_avg_ms", recent_hours: float = 2.0,
     recent = [float(v) for ts, _m, v in rows if ts >= cutoff]
     base = [float(v) for ts, _m, v in rows if ts < cutoff]
     span_h = (rows[-1][0] - rows[0][0]) / 3600.0
-    r.update(span_h=span_h, n_recent=len(recent), n_base=len(base))
+
+    contaminated = False
+    if baseline_before is not None:
+        clean = [float(v) for ts, _m, v in rows if ts < min(cutoff, baseline_before)]
+        # Only worth taking if what remains can still calibrate a floor. Truncating below that
+        # would turn "the baseline is dirty" into "there is no verdict", and a signal stuck
+        # without a verdict can never clear even after it genuinely recovers.
+        if len(clean) >= max(6, len(recent) + MIN_PLACEBO_WINDOWS):
+            base = clean
+        else:
+            contaminated = True
+    r.update(span_h=span_h, n_recent=len(recent), n_base=len(base),
+             baseline_before=baseline_before, baseline_contaminated=contaminated)
 
     if not recent:
         r["reason"] = (f"{target}/{metric} {where}: no measurements in the last "
@@ -498,6 +520,16 @@ def format_assessment(r: dict) -> str:
     if r["span_h"] < 24:
         out.append(f"  CAVEAT: history spans {r['span_h']:.1f} h, covering no full day-night "
                    f"cycle, so a normal diurnal swing can masquerade as a change.")
+    if r.get("baseline_before"):
+        when = time.strftime("%d %b %H:%M", time.localtime(r["baseline_before"]))
+        if r.get("baseline_contaminated"):
+            out.append(f"  CAVEAT: this excursion began around {when} and its own samples are "
+                       f"still in the baseline - too little history predates it to calibrate "
+                       f"on. The floor below is therefore inflated BY the event it is judging, "
+                       f"so treat 'within the floor' as unproven, not as recovered.")
+        else:
+            out.append(f"  baseline excludes everything from {when}, when this excursion "
+                       f"began, so the floor is calibrated on history that predates it.")
     if r.get("horizon"):
         out.append(r["horizon"])
     return "\n".join(out)
