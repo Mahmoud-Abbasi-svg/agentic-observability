@@ -120,6 +120,25 @@ CREATE TABLE alert_state (
 );
 ```
 
+```sql
+CREATE TABLE path (                -- the route, as one traceroute saw it
+    ts        REAL    NOT NULL,
+    target    TEXT    NOT NULL,
+    net_id    TEXT    NOT NULL,
+    sig       TEXT    NOT NULL,   -- hop addresses in order, '*' for a silent hop
+    hops      TEXT    NOT NULL,   -- JSON [[addr, [rtt_ms, ...]], ...]
+    reached   INTEGER NOT NULL,
+    PRIMARY KEY (target, ts)
+);
+```
+
+A path is stored as a sequence rather than reduced to a number, because the question it
+exists for — did the *route* change, or did the same route get slower? — cannot be asked of
+a number. Its retention differs from a sample's: beyond the raw window a trace that repeats
+the one before it says nothing new, so only the traces where the route *differed* from its
+predecessor survive. Every change point, for a year, at a few hundred bytes each; per-hop
+latencies for 14 days.
+
 **Retention, decided up front rather than when the disk fills:** raw samples for 14 days,
 hourly aggregates (mean, min, max, count) for 12 months, raw discarded after aggregation.
 At one sample/minute across 10 targets that is ~200k rows raw — trivial — and the aggregate

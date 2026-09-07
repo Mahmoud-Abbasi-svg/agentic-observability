@@ -23,6 +23,7 @@ after the fact, so every baseline built before it would have to be thrown away.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import re
@@ -111,6 +112,21 @@ CREATE TABLE IF NOT EXISTS alert_log (
     detail TEXT
 );
 CREATE INDEX IF NOT EXISTS alert_log_ts ON alert_log (ts);
+
+-- The route to a target, hop by hop, as one traceroute saw it. Kept as a sequence rather
+-- than reduced to a number, because the question it exists for - did the ROUTE change, or
+-- did the same route get slower - cannot be asked of a number. `sig` is the hop addresses
+-- in order with '*' for a silent hop; `hops` carries the per-hop round-trip times as well.
+CREATE TABLE IF NOT EXISTS path (
+    ts      REAL    NOT NULL,
+    target  TEXT    NOT NULL,
+    net_id  TEXT    NOT NULL,
+    sig     TEXT    NOT NULL,
+    hops    TEXT    NOT NULL,        -- JSON [[addr, [rtt_ms, ...]], ...]
+    reached INTEGER NOT NULL,        -- 1 if the last answering hop was the target itself
+    PRIMARY KEY (target, ts)
+);
+CREATE INDEX IF NOT EXISTS path_lookup ON path (target, net_id, ts);
 
 CREATE TABLE IF NOT EXISTS net (
     net_id   TEXT PRIMARY KEY,
@@ -452,6 +468,27 @@ def add_heartbeat(conn: sqlite3.Connection, net_id: str, n_ok: int, n_failed: in
                  (int(time.time()), net_id, n_ok, n_failed))
 
 
+def add_path(conn: sqlite3.Connection, target: str, hops: list, net_id: str,
+             reached: bool, ts: Optional[float] = None) -> None:
+    """Store one traceroute. `hops` is [(addr, [rtt_ms, ...]), ...] with '*' for silence."""
+    ts = round(float(ts if ts is not None else time.time()), 6)
+    sig = " ".join(a for a, _r in hops)
+    conn.execute("INSERT OR REPLACE INTO path (ts,target,net_id,sig,hops,reached) "
+                 "VALUES (?,?,?,?,?,?)",
+                 (ts, target, net_id, sig, json.dumps([[a, r] for a, r in hops]),
+                  1 if reached else 0))
+
+
+def paths(conn: sqlite3.Connection, target: str, net_id: str,
+          days: float = 7.0) -> list[tuple[float, str, list, int]]:
+    """(ts, sig, hops, reached) for one target ON THIS NETWORK ONLY, oldest first."""
+    cutoff = time.time() - days * 86400
+    return [(ts, sig, [(a, r) for a, r in json.loads(h)], reached)
+            for ts, sig, h, reached in conn.execute(
+                "SELECT ts, sig, hops, reached FROM path WHERE target=? AND net_id=? "
+                "AND ts>=? ORDER BY ts", (target, net_id, cutoff))]
+
+
 def series(conn: sqlite3.Connection, target: str, metric: str, net_id: str,
            days: float = 7.0) -> list[tuple[int, float]]:
     """Samples for one (target, metric) ON THIS NETWORK ONLY. The net_id filter is the point."""
@@ -495,14 +532,28 @@ def aggregate_and_prune(conn: sqlite3.Connection, now: Optional[int] = None) -> 
     hourly_cutoff = now - HOURLY_RETENTION_DAYS * 86400
     conn.execute("DELETE FROM sample_hourly WHERE hour < ?", (hourly_cutoff,))
     conn.execute("DELETE FROM heartbeat WHERE ts < ?", (hourly_cutoff,))
+    # Paths thin out differently from samples: beyond the raw window a trace that repeats the
+    # one before it says nothing new, so only the traces where the route DIFFERED from its
+    # predecessor survive - every change point, for a year, at a few hundred bytes each.
+    # Per-hop latencies for "the same route got slower" therefore reach back 14 days; route
+    # changes reach back 365.
+    paths_dropped = conn.execute("""
+        DELETE FROM path WHERE rowid IN (
+            SELECT rowid FROM (
+                SELECT rowid, ts, sig,
+                       LAG(sig) OVER (PARTITION BY target, net_id ORDER BY ts) AS prev
+                FROM path)
+            WHERE ts < ? AND prev = sig)""", (raw_cutoff,)).rowcount
+    conn.execute("DELETE FROM path WHERE ts < ?", (hourly_cutoff,))
     conn.commit()
-    return {"raw_rows_dropped": dropped}
+    return {"raw_rows_dropped": dropped, "path_rows_dropped": paths_dropped}
 
 
 def stats(conn: sqlite3.Connection) -> dict:
     q = lambda s: conn.execute(s).fetchone()[0]                              # noqa: E731
     return dict(samples=q("SELECT COUNT(*) FROM sample"),
                 hourly=q("SELECT COUNT(*) FROM sample_hourly"),
+                paths=q("SELECT COUNT(*) FROM path"),
                 heartbeats=q("SELECT COUNT(*) FROM heartbeat"),
                 targets=q("SELECT COUNT(DISTINCT target) FROM sample"),
                 networks=q("SELECT COUNT(*) FROM net"),

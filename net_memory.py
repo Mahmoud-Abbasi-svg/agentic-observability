@@ -134,6 +134,13 @@ def extract_metrics(tool: str, text: str) -> dict[str, float]:
             pass                    # never tested: nothing to record about the port
         elif label:
             m["open"] = 0.0         # REFUSED, NO_ANSWER, UNREACHABLE, or the old CLOSED_OR_FILTERED
+    elif tool == "traceroute":
+        # The path itself is stored separately (see parse_trace / net_store.add_path); these
+        # two are what a sample can carry: how long the route is and whether it got there.
+        p = parse_trace(text)
+        if p["hops"]:
+            m["path_hops"] = float(len(p["hops"]))
+            m["path_reached"] = 1.0 if p["reached"] else 0.0
     elif tool == "http_check":
         st, el = _f(r"status=([0-9]+)", text), _f(r"elapsed_ms=([0-9.]+)", text)
         if st is not None:
@@ -186,6 +193,10 @@ def record(tool: str, args: dict, output: str) -> None:
         c = conn()
         net_store.remember_net(c, net)
         net_store.add_samples(c, target, metrics, net["net_id"])
+        if tool == "traceroute":
+            p = parse_trace(output or "")
+            if p["hops"]:
+                net_store.add_path(c, target, p["hops"], net["net_id"], p["reached"])
         c.commit()
     except Exception:
         pass
@@ -1174,6 +1185,380 @@ def availability(target: str = "", hours: float = 24.0) -> str:
             parts.append("At no point was every host under observation down together: the "
                          "failures above are per-host, not a network outage.")
     return "\n\n".join(parts)
+
+
+# --------------------------------------------------------------------------- the route
+#
+# Every tool above measures the END of a path. traceroute measures the path itself, and until
+# this section existed its output was read once and discarded: the agent could see today's
+# route but never yesterday's, so the question a latency rise actually turns on - did the
+# ROUTE change, or did the same route get slower? - could not be asked. The two produce the
+# same end-to-end symptom and have different owners: a changed route is upstream routing; a
+# slower one is congestion or a failing link on a path that is otherwise intact.
+#
+# The trap in reading paths over time is per-flow load balancing (ECMP). Routers spread flows
+# across equal-cost links by hashing packet headers, so a probe whose headers vary from one
+# trace to the next can take a different branch each time while nothing about the network has
+# changed. Two traces that differ are therefore not evidence of a change. A route that
+# ALTERNATES is a fact about the topology, and reporting every alternation as a change would be
+# the attribution error this project keeps finding in its own tools: the measurement right, the
+# meaning invented. So paths are read as runs, and a rate of alternation no reroute could
+# produce is named for what it is before any change is claimed.
+
+MIN_RUN = 3            # consecutive traces before a path counts as established
+ROTATION_RATE = 0.05   # transitions per trace above which alternation, not change, is read
+PATH_RECENT_HOURS = 2.0
+
+_IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])")
+_IPV6 = re.compile(r"(?<![\w:])((?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4})(?![\w:])")
+_RTT = re.compile(r"<?\s*(\d+(?:[.,]\d+)?)\s*ms\b")
+_HOP_LINE = re.compile(r"^\s*(\d{1,2})\s+(.*?)\s*$")
+
+
+def _is_ip(s: str) -> bool:
+    return bool(_IPV4.fullmatch(s) or _IPV6.fullmatch(s))
+
+
+def parse_trace(text: str) -> dict:
+    """Hops from tracert/traceroute output, in either binary's format and any locale.
+
+    Returns dict(hops=[(addr, [rtt_ms, ...]), ...], target_ip, reached, max_hops). Nothing
+    depends on translated words: a hop line is its number followed by anything, an address is
+    an address, a round-trip time is a number followed by "ms", and a hop with no address is
+    silent ('*'). "<1 ms" is recorded as 1 ms. Hop lines must be consecutive from 1, which is
+    what keeps a stray numbered line in the raw output from becoming a hop.
+
+    A trace that did not reach its target has its trailing silent hops trimmed, so "stopped
+    answering after hop 4" reads the same whatever hop limit the trace was run with.
+    """
+    text = text or ""
+    hops: list[tuple[str, list[float]]] = []
+    header_ip: Optional[str] = None
+    for line in text.splitlines():
+        hm = _HOP_LINE.match(line)
+        if not hm:
+            if header_ip is None:
+                bm = re.search(r"[\[(]\s*(\S+?)\s*[\])]", line)
+                if bm and _is_ip(bm.group(1)):
+                    header_ip = bm.group(1)
+            continue
+        n, rest = int(hm.group(1)), hm.group(2)
+        if n != len(hops) + 1:
+            continue
+        addrs = _IPV4.findall(rest) or _IPV6.findall(rest)
+        rtts = [float(x.replace(",", ".")) for x in _RTT.findall(rest)]
+        hops.append((addrs[0] if addrs else "*", rtts))
+    m = re.search(r"max_hops=(\d+)", text)
+    max_hops = int(m.group(1)) if m else None
+    hm = re.search(r"^host=(\S+)", text, re.M)
+    host = hm.group(1) if hm else ""
+    target_ip = header_ip or (host if _is_ip(host) else None)
+    if target_ip is not None:
+        reached = bool(hops) and hops[-1][0] == target_ip
+    else:
+        reached = bool(hops) and hops[-1][0] != "*" and (max_hops is None
+                                                         or len(hops) < max_hops)
+    if not reached:
+        while hops and hops[-1][0] == "*":
+            hops.pop()
+    return dict(hops=hops, target_ip=target_ip, reached=reached, max_hops=max_hops)
+
+
+def _compatible(a: list[str], b: list[str]) -> bool:
+    return len(a) == len(b) and all(x == y or x == "*" or y == "*" for x, y in zip(a, b))
+
+
+def _path_classes(recs: list[tuple]) -> tuple[list[dict], list[int]]:
+    """Group traces into paths, treating a silent hop as a wildcard.
+
+    A router that answers TTL-exceeded probes one minute and rate-limits them the next has not
+    moved; packets still go through it. So '*' matches anything at its position, and each
+    class keeps the most complete description seen, filled in from whichever traces revealed
+    an address there. A trace silent at exactly the hop that separates two paths is filed with
+    whichever was seen first - the trace does not say which it took.
+    """
+    classes: list[dict] = []
+    labels: list[int] = []
+    for ts, sig, _hops, reached in recs:
+        addrs = sig.split(" ")
+        for k, c in enumerate(classes):
+            if _compatible(c["addrs"], addrs):
+                c["addrs"] = [y if x == "*" else x for x, y in zip(c["addrs"], addrs)]
+                c["n"], c["last"] = c["n"] + 1, ts
+                labels.append(k)
+                break
+        else:
+            classes.append(dict(addrs=list(addrs), n=1, first=ts, last=ts,
+                                reached=bool(reached)))
+            labels.append(len(classes) - 1)
+    return classes, labels
+
+
+def _path_diff(a: list[str], b: list[str]) -> str:
+    n = min(len(a), len(b))
+    first = next((i for i in range(n) if a[i] != b[i] and "*" not in (a[i], b[i])), None)
+    if first is None:
+        return (f"same addresses, {len(a)} vs {len(b)} hops" if len(a) != len(b)
+                else "same addresses")
+    k = 0
+    while (k < min(len(a), len(b)) - first - 1
+           and (a[-1 - k] == b[-1 - k] or "*" in (a[-1 - k], b[-1 - k]))):
+        k += 1
+    txt = f"diverges at hop {first + 1} ({a[first]} -> {b[first]})"
+    if k:
+        txt += f", rejoins for the last {k} hop(s)"
+    return txt
+
+
+def _letter(i: int) -> str:
+    return chr(ord("A") + i) if i < 26 else f"P{i + 1}"
+
+
+def _hop_table(recs: list[tuple], labels: list[int], cur: int, addrs: list[str],
+               now: float, days: float) -> list[str]:
+    """Per-hop median round-trip on the current path, recent traces against the earlier ones.
+
+    This is the half of the question the path classes cannot answer. The route being the same
+    says nothing about how it is performing; if latency rose, this is where on it the rise
+    sits. Only where - whether the rise is real against the path's own noise is detect_change's
+    question, and the table does not pretend to answer it.
+    """
+    cut = now - PATH_RECENT_HOURS * 3600
+    mine = [r for r, l in zip(recs, labels) if l == cur]
+    recent = [r for r in mine if r[0] >= cut]
+    before = [r for r in mine if r[0] < cut]
+    if len(recent) < 2 or len(before) < 2:
+        return [f"hop latency: not compared - {len(recent)} trace(s) on this path in the last "
+                f"{PATH_RECENT_HOURS:g} h and {len(before)} before that; at least 2 of each "
+                f"are needed"]
+
+    def medians(rs: list[tuple]) -> list[Optional[float]]:
+        out: list[Optional[float]] = []
+        for i in range(len(addrs)):
+            vals = [v for r in rs if i < len(r[2]) for v in r[2][i][1]]
+            out.append(statistics.median(vals) if vals else None)
+        return out
+
+    mb, mr = medians(before), medians(recent)
+    out = [f"hop latency on path {_letter(cur)}, last {PATH_RECENT_HOURS:g} h "
+           f"({len(recent)} traces) vs the earlier {len(before)} traces in the window, "
+           f"medians:",
+           f"  {'hop':>3}  {'address':<18}{'before':>8}{'recent':>8}   change"]
+    deltas: list[Optional[float]] = []
+    for i, a in enumerate(addrs):
+        b, r = mb[i], mr[i]
+        d = (r - b) if (b is not None and r is not None) else None
+        deltas.append(d)
+        fb = f"{b:.1f}" if b is not None else "-"
+        fr = f"{r:.1f}" if r is not None else "-"
+        fd = f"{d:+.1f} ms" if d is not None else ("silent" if a == "*" else "-")
+        out.append(f"  {i + 1:>3}  {a:<18}{fb:>8}{fr:>8}   {fd}")
+    known = [(i, d) for i, d in enumerate(deltas) if d is not None]
+    if not known:
+        return out
+    i_max, d_max = max(known, key=lambda x: x[1])
+    if d_max <= 0:
+        out.append("  no hop is slower recently than before")
+        return out
+    # Onset and peak are different hops. The rise that matters is the one every hop from some
+    # point onward shares - forwarding delay accumulates - and its onset is the first hop of
+    # that stretch, not the hop where it happens to be largest. A rise the later hops do NOT
+    # share is a router answering probes slowly, which delays nothing passing through it.
+    thr = 0.5 * d_max
+    onset = next((i for i, _d in known
+                  if all(d >= thr for j, d in known if j >= i)), None)
+    last_i = known[-1][0]
+    if onset is None:
+        out.append(f"  the largest rise is at hop {i_max + 1} (+{d_max:.1f} ms) but the hops "
+                   f"after it do not share it: that router is answering probes slowly, which "
+                   f"does not delay traffic through it")
+    elif onset == last_i:
+        out.append(f"  the rise is at the last hop only (+{d_max:.1f} ms): the target itself "
+                   f"answering more slowly; the path to it is unchanged")
+    else:
+        d_on = dict(known)[onset]
+        line = (f"  the rise first appears at hop {onset + 1} (+{d_on:.1f} ms) and every later "
+                f"hop shares it: it sits on the path at or before that hop")
+        if i_max < onset:
+            line += (f"; hop {i_max + 1} alone shows +{d_max:.1f} ms, which the hops after it "
+                     f"do not share - that router answering slowly, not the path")
+        out.append(line)
+    out.append("  whether the end-to-end rise is real against this path's own noise is "
+               "detect_change's question; this table only says where on the path it sits")
+    return out
+
+
+def route_history(target: str, days: float = 7.0) -> str:
+    """Did the route to a host change, or did the same route get slower?
+
+    A single traceroute shows today's path and cannot say whether it is the usual one. This
+    reads every stored trace to the host on this network, in order, and reports the paths
+    taken as runs - like availability does for reachability - so a change has a time, a
+    before and an after, and a hop where the two diverge.
+
+    Three verdicts, and the middle one is the point:
+      STABLE       every trace took the same path (a hop that sometimes does not answer is
+                   the same hop, not a different route).
+      ALTERNATING  the path switches every few traces, throughout. That is per-flow load
+                   balancing: the network hashes each probe onto one of several equal-cost
+                   links. It is a fact about the topology, not a change, and two traces that
+                   differ are not evidence of one.
+      CHANGED      one path was established, then another was, and the first did not come
+                   back. The change is placed between the last trace on the old path and
+                   the first on the new one.
+
+    Then, for the path the latest trace took, per-hop latency now against earlier: where on
+    the route a rise sits, if there is one. Whether that rise is real is detect_change's
+    question; this only says where.
+
+    Traces are recorded whenever traceroute runs, and by the collector for targets configured
+    with kind "trace". Beyond the raw retention window only the traces where the route
+    differed from the one before are kept, so trace counts that far back are not comparable.
+
+    Args:
+        target: Host or IP exactly as it was traced.
+        days: How far back to read.
+    """
+    net = net_store.network_identity()
+    now = time.time()
+    recs = net_store.paths(conn(), target, net["net_id"], days)
+    head = f"route to {target} on network {net['label']!r}, last {days:g} d"
+    if not recs:
+        return (f"{head}: no traces recorded. Run traceroute to record one now; the collector "
+                f"records one every few minutes for targets configured with kind \"trace\". "
+                f"One trace shows a path; it takes several to say whether it is the usual one.")
+    diffs = [b[0] - a[0] for a, b in zip(recs, recs[1:]) if b[0] > a[0]]
+    cadence = statistics.median(diffs) if diffs else 0.0
+    out = [f"{head}: {len(recs)} trace(s)"
+           + (f", {_fmt_dur(cadence)} apart (median)" if cadence else "")
+           + f", {_fmt_t(recs[0][0], now)} -> {_fmt_t(recs[-1][0], now)}"]
+    if days > RAW_DAYS:
+        out.append(f"  (beyond {RAW_DAYS} d only route-change traces are kept, so counts and "
+                   f"latencies before {_fmt_t(now - RAW_DAYS * 86400, now)} are partial)")
+    classes, labels = _path_classes(recs)
+    cur = labels[-1]
+
+    def show(c: dict, k: int) -> list[str]:
+        tag = "" if c["reached"] else "   (did not reach the target: last answering hop shown)"
+        lines = [f"  path {_letter(k)}: {len(c['addrs'])} hops, {c['n']} trace(s), "
+                 f"{_fmt_t(c['first'], now)} -> {_fmt_t(c['last'], now)}{tag}"]
+        for i, a in enumerate(c["addrs"]):
+            lines.append(f"    {i + 1:>3}  {a}" + ("   (never answered)" if a == "*" else ""))
+        return lines
+
+    if len(recs) == 1:
+        out.append("ONE TRACE: a path, but nothing to compare it with. Trace again later, or "
+                   "configure the collector to trace this host.")
+        out += show(classes[0], 0)
+        return "\n".join(out)
+
+    transitions = sum(1 for a, b in zip(labels, labels[1:]) if a != b)
+    rate = transitions / (len(labels) - 1)
+
+    if len(classes) == 1:
+        silent = sum(1 for r in recs if "*" in r[1].split(" "))
+        out.append(f"STABLE: every trace took the same path"
+                   + (f" ({silent} of {len(recs)} had a hop that did not answer; that is the "
+                      f"same hop, not a different route)" if silent else ""))
+        out += show(classes[0], 0)
+        out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days)
+        return "\n".join(out)
+
+    if rate > ROTATION_RATE:
+        out.append(f"ALTERNATING: {len(classes)} paths in rotation, a switch every "
+                   f"{1 / rate:.1f} traces on average ({transitions} switches in {len(recs)} "
+                   f"traces). This is what per-flow load balancing looks like from a "
+                   f"traceroute: the network hashes each probe onto one of several equal-cost "
+                   f"links. It is not a route change, and two traces that differ are not "
+                   f"evidence of one.")
+        third = (recs[-1][0] - recs[0][0]) / 3.0
+        early = {l for r, l in zip(recs, labels) if r[0] < recs[0][0] + third}
+        late = {l for r, l in zip(recs, labels) if r[0] > recs[-1][0] - third}
+        if third > 0 and early != late:
+            out.append(f"  BUT the set of paths in rotation itself changed: "
+                       f"{', '.join(_letter(l) for l in sorted(early))} in the first third of "
+                       f"the window, {', '.join(_letter(l) for l in sorted(late))} in the "
+                       f"last. That is a change underneath the alternation - read each path's "
+                       f"first and last trace below.")
+        for k, c in sorted(enumerate(classes), key=lambda kc: -kc[1]["n"]):
+            share = 100.0 * c["n"] / len(recs)
+            out.append(f"  path {_letter(k)}: {share:.0f}% of traces, {len(c['addrs'])} hops, "
+                       f"{_fmt_t(c['first'], now)} -> {_fmt_t(c['last'], now)}"
+                       + (f"; vs {_letter(0)}: {_path_diff(classes[0]['addrs'], c['addrs'])}"
+                          if k else ""))
+        out += show(classes[cur], cur)
+        out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days)
+        return "\n".join(out)
+
+    # Sequential: runs of consecutive traces on one path. Established runs make the timeline;
+    # runs shorter than MIN_RUN are excursions and are counted, not read as changes.
+    runs: list[dict] = []
+    for (ts, _s, _h, _r), l in zip(recs, labels):
+        if runs and runs[-1]["cls"] == l:
+            runs[-1]["end"], runs[-1]["n"] = ts, runs[-1]["n"] + 1
+        else:
+            runs.append(dict(cls=l, start=ts, end=ts, n=1))
+    # An established path interrupted by an excursion and resumed is ONE stretch on that path,
+    # not two with a change between them. The first version reported "A -> A" three times for
+    # three lone traces elsewhere.
+    est: list[dict] = []
+    for r in runs:
+        if r["n"] < MIN_RUN:
+            continue
+        if est and est[-1]["cls"] == r["cls"]:
+            est[-1]["end"], est[-1]["n"] = r["end"], est[-1]["n"] + r["n"]
+        else:
+            est.append(dict(r))
+    short = [r for r in runs if r["n"] < MIN_RUN]
+    changes: list[str] = []
+    seen_cls: list[int] = []
+    timeline: list[str] = []
+    for i, r in enumerate(est):
+        k = r["cls"]
+        line = (f"  {_fmt_t(r['start'], now)} -> {_fmt_t(r['end'], now):<13}  path {_letter(k)}"
+                f"   {r['n']} traces")
+        if i:
+            prev = est[i - 1]
+            line += f"   {_path_diff(classes[prev['cls']]['addrs'], classes[k]['addrs'])}"
+            gap = r["start"] - prev["end"]
+            when = f"between {_fmt_t(prev['end'], now)} and {_fmt_t(r['start'], now)}"
+            if cadence and gap > 4 * cadence:
+                when += (f" - no traces for {_fmt_dur(gap)} in between, so the change is "
+                         f"somewhere in that stretch")
+            back = " (back to a path seen before)" if k in seen_cls else ""
+            changes.append(f"{_letter(prev['cls'])} -> {_letter(k)} {when}{back}")
+        seen_cls.append(k)
+        timeline.append(line)
+    if not est:
+        out.append(f"NO PATH ESTABLISHED: no run of {MIN_RUN} consecutive traces on one path "
+                   f"in {len(recs)} traces, yet only {transitions} switches - too few traces "
+                   f"to read. Trace again.")
+    elif changes:
+        out.append(f"CHANGED {len(changes)} time(s):")
+        out += [f"  {c}" for c in changes]
+        out.append("  Not load balancing: the paths hold for runs of traces rather than "
+                   "alternating, and the old path does not recur inside the new one's run.")
+    else:
+        out.append(f"STABLE: one path established throughout ({_letter(est[0]['cls'])}, "
+                   f"{est[0]['n']} consecutive traces)")
+    if short:
+        by_cls: dict[int, int] = {}
+        for r in short:
+            by_cls[r["cls"]] = by_cls.get(r["cls"], 0) + r["n"]
+        what = ", ".join(f"{n} on path {_letter(k)}" for k, n in sorted(by_cls.items()))
+        out.append(f"  plus {sum(by_cls.values())} trace(s) in {len(short)} excursion(s) "
+                   f"shorter than {MIN_RUN} traces ({what}): an occasional alternate or a "
+                   f"momentary reroute, not a change")
+    if est and runs[-1]["n"] < MIN_RUN and runs[-1]["cls"] != est[-1]["cls"]:
+        out.append(f"  the latest {runs[-1]['n']} trace(s) took path {_letter(runs[-1]['cls'])}, "
+                   f"too few to call established: a change in progress or a transient. "
+                   f"Trace again to tell.")
+    out.append("timeline of established paths:")
+    out += timeline
+    for k, c in enumerate(classes):
+        out += show(c, k)
+    out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days)
+    return "\n".join(out)
 
 
 # --------------------------------------------------------------------------- migration

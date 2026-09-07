@@ -51,6 +51,11 @@ KINDS = {
             lambda t, h: {"server": h, "name": t.get("query", "example.com"),
                           "protocol": t.get("protocol", "udp")}),
     "http": (net_tools.http_check, lambda t, h: {"url": h}),
+    # The path, not a number about it. Slow (a silent hop costs 4.5 s), so a long interval;
+    # the record is what lets route_history tell "the route changed" from "the same route
+    # got slower", which no per-target metric can.
+    "trace": (net_tools.traceroute,
+              lambda t, h: {"host": h, "max_hops": t.get("max_hops", 20)}),
 }
 
 DEFAULT_CONFIG = {
@@ -63,6 +68,8 @@ DEFAULT_CONFIG = {
         {"name": "dns-udp", "kind": "dns", "host": "1.1.1.1", "interval_s": 300},
         {"name": "example-http", "kind": "http", "host": "https://example.com",
          "interval_s": 300},
+        {"name": "cloudflare-path", "kind": "trace", "host": "1.1.1.1", "max_hops": 20,
+         "interval_s": 600},
     ]
 }
 
@@ -108,7 +115,10 @@ def probe(target: dict, net: dict) -> tuple[str, str, dict]:
         out = fn(**build(target, host))
     except Exception as e:
         return target["name"], host, {"_error": f"{type(e).__name__}: {e}"[:120]}
-    return target["name"], host, net_memory.extract_metrics(fn.__name__, out)
+    metrics = net_memory.extract_metrics(fn.__name__, out)
+    if target["kind"] == "trace":
+        metrics["_path"] = net_memory.parse_trace(out)       # stored as a path, not a sample
+    return target["name"], host, metrics
 
 
 def cycle(conn, cfg: dict, due: list[dict], workers: int = 4, verbose: bool = True) -> dict:
@@ -142,6 +152,9 @@ def cycle(conn, cfg: dict, due: list[dict], workers: int = 4, verbose: bool = Tr
             # "cloudflare" the two would never merge, and each would build its own weaker,
             # disagreeing notion of normal for the same host.
             net_store.add_samples(conn, host, real, net["net_id"])
+        p = metrics.get("_path")
+        if p and p["hops"]:
+            net_store.add_path(conn, host, p["hops"], net["net_id"], p["reached"])
         if err:
             n_broken += 1                      # a broken probe, recorded nowhere
         elif not real:

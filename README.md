@@ -52,7 +52,7 @@ diagnosis without a retry.
 |---|---|
 | `net_tools.py` | the eight diagnostic tools. Importable and runnable on its own — `python net_tools.py` exercises each one |
 | `net_store.py` | SQLite store, retention policy, and the network identity (`net_id`) |
-| `net_memory.py` | `baseline`, `detect_change`, `can_detect`, `coverage`, `availability`, and the `assess` statistics behind them |
+| `net_memory.py` | `baseline`, `detect_change`, `can_detect`, `coverage`, `availability`, `route_history`, and the `assess` statistics behind them |
 | `net_precision.py` | `instrument_options` — measures the agent's own instruments to find which could resolve a given change |
 | `net_season.py` | tests each signal for a repeatable daily rhythm, and narrows the floor only where one is real |
 | `net_size.py` | sets each target's sampling interval from the resolution you need — `python net_size.py [--apply]` |
@@ -70,6 +70,7 @@ diagnosis without a retry.
 | `test_net_verify.py` | validates that unsupportable claims are caught *and* that plain readings are not |
 | `test_net_ingest.py` | validates pcap parsing against a capture whose response times are known by construction |
 | `test_net_eval.py` | validates that the eval's deterministic scoring does not fire on correct answers |
+| `test_net_path.py` | validates that a route change is told from load balancing, and from the same route getting slower |
 | `net_monitor.db` | the store (created on first run; override with `NET_MONITOR_DB`) |
 | `monitor.json` | which targets to collect, how often, optional webhook |
 
@@ -321,6 +322,79 @@ Three things in that output were each got wrong once before they were got right:
   ```
 
   Found by an eval run, one day after shipping the fix it corrects.
+
+### `route_history` — did the route change, or did the same route get slower?
+
+Every other tool measures the *end* of a path. `traceroute` measures the path itself, and
+until now its output was read once and discarded: the agent could see today's route but never
+yesterday's, so the question a latency rise actually turns on could not be asked. The two
+causes produce the same end-to-end symptom and have different owners — a changed route is
+upstream routing; a slower one is congestion or a failing link on a path that is intact.
+
+The collector now records a trace every ten minutes for targets of kind `"trace"`, and every
+traceroute the agent runs is stored too. `route_history` reads them in order and reports the
+paths as runs, the way `availability` reports reachability:
+
+```
+route to 1.1.1.1 on network 'hotspot', last 7 d: 812 traces, 10 min apart (median), 01 Sep 10:00 -> now
+CHANGED 1 time(s):
+  A -> B between 05 Sep 06:27 and 05 Sep 06:31
+  Not load balancing: the paths hold for runs of traces rather than alternating, and the old
+  path does not recur inside the new one's run.
+timeline of established paths:
+  01 Sep 10:00 -> 05 Sep 06:27   path A   288 traces
+  05 Sep 06:31 -> now            path B   523 traces   diverges at hop 4 (172.29.37.33 -> 172.29.37.41), rejoins for the last 3 hop(s)
+```
+
+**The trap is per-flow load balancing.** Routers spread flows across equal-cost links by
+hashing packet headers, so a probe can take a different branch on every trace while nothing
+about the network has changed. Two traces that differ are therefore *not* evidence of a
+change, and a tool that reported each difference as one would be the attribution error this
+project keeps finding in its own instruments — the measurement right, the meaning invented.
+So there are three verdicts, and the middle one is the point:
+
+| verdict | what the traces show | what it means |
+|---|---|---|
+| `STABLE` | one path throughout; a hop that sometimes fails to answer is a wildcard, not a different route | nothing to explain |
+| `ALTERNATING` | the path switches more often than once per 20 traces, all window long | ECMP: a fact about the topology, not a change — and it checks whether the *set* of rotating paths itself changed, which is a change underneath the alternation |
+| `CHANGED` | one path established for ≥3 consecutive traces, then another, and the first does not come back | placed between the last trace on the old path and the first on the new; across a gap it says the change is somewhere in the unobserved stretch |
+
+Lone traces on another path are counted as *excursions*, never as changes. The first version
+reported "A -> A" three times for three lone traces elsewhere — an established path resumed
+after an excursion is one stretch, not two with a change between them.
+
+Then the second half of the question. For the path the latest trace took, per-hop latency now
+against earlier:
+
+```
+hop latency on path A, last 2 h (11 traces) vs the earlier 49 traces in the window, medians:
+  hop  address             before  recent   change
+    4  172.29.37.33          39.0    39.0   +0.0 ms
+    5  *                        -       -   silent
+    6  188.114.108.4         45.0    85.0   +40.0 ms
+    7  188.114.108.10        48.0    90.0   +42.0 ms
+    9  1.1.1.1               54.0    94.0   +40.0 ms
+  the rise first appears at hop 6 (+40.0 ms) and every later hop shares it: it sits on the
+  path at or before that hop
+  whether the end-to-end rise is real against this path's own noise is detect_change's
+  question; this table only says where on the path it sits
+```
+
+Two distinctions the table is built around. *Onset and peak are different hops*: forwarding
+delay accumulates, so the rise that matters is the one every later hop shares, and its onset
+is the first hop of that stretch, not the hop where it happens to be largest (the first
+version named hop 7 above). And *a rise at one hop that the hops after it do not share is
+that router answering probes slowly*, which delays nothing passing through it — reported as
+such, separately from any rise that persists. The table says **where**; whether the rise is
+real is still `detect_change`'s call against the path's own noise floor, and the table says
+so rather than adding a second verdict of its own.
+
+Beyond the 14-day raw window only the traces where the route *differed* from the one before
+are kept, so every change point survives for a year at a few hundred bytes each, while
+per-hop latencies reach back 14 days. Validated in `test_net_path.py` against constructed
+histories: a clean change, a change and return, random alternation, alternation whose set
+changes, scattered excursions, a change across a gap, and rises that persist, that do not,
+and that sit on the target alone.
 
 ### `net_report.py` — the two things prose hides
 

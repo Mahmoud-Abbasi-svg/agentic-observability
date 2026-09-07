@@ -155,7 +155,15 @@ network healthy tonight" question, call availability: it lists the runs in order
 length, whether they ended or measurement simply stopped, and whether every host failed \
 together (the network) or one did (that host).
 
-11. When you cannot resolve something, say what would. can_detect tells you the current setup \
+12. For "did the route change", "is the path different", or any latency rise on a host with \
+history, call route_history before traceroute. One traceroute shows today's path and cannot \
+say whether it is the usual one. Read its verdict as it stands: a route that ALTERNATES \
+between paths is load balancing, not a change, and two traces that differ are not evidence \
+of one. It also shows per-hop latency for the current path against its own history, which is \
+what separates "the route changed" from "the same route got slower" - the two have different \
+owners. It says WHERE a rise sits; whether the rise is real is still detect_change's call.
+
+13. When you cannot resolve something, say what would. can_detect tells you the current setup \
 is not precise enough; instrument_options tells you which of your instruments, if any, could \
 be. It runs real measurements and takes tens of seconds, so use it when a resolution question \
 is genuinely blocking an answer, not routinely. Note what it reports: an instrument's usable \
@@ -185,6 +193,7 @@ TOOLS = {**MEASUREMENT_TOOLS,
          "can_detect": net_memory.can_detect,
          "coverage": net_memory.coverage,
          "availability": net_memory.availability,
+         "route_history": net_memory.route_history,
          "instrument_options": net_precision.instrument_options}
 
 
