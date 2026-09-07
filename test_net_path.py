@@ -138,8 +138,10 @@ def main() -> int:
     for i in range(60, 0, -1):
         put("stable", i, A, silent_at=(3 if i % 4 == 0 else None))
     t = net_memory.route_history("stable", 1)
-    ok &= check("a hop that sometimes does not answer is the same route: STABLE, one path",
-                t.startswith("route to stable") and "STABLE" in t and "path B" not in t
+    ok &= check("a hop that sometimes does not answer is the same route: STABLE, one path, "
+                "scoped to the span covered",
+                t.startswith("route to stable") and "STABLE over 9.8 h" in t
+                and "path B" not in t
                 and "CHANGED" not in t and "ALTERNATING" not in t, t.splitlines()[1][:70])
     ok &= check("the silent hop is filled in from the traces that saw it",
                 "  4  172.29.37.33" in t and "(never answered)" in t)
@@ -277,6 +279,14 @@ def main() -> int:
     t = net_memory.route_history("once", 1)
     ok &= check("one trace: a path but no comparison, and no verdict",
                 "ONE TRACE" in t and "STABLE" not in t and "CHANGED" not in t)
+    # Live, three minutes after the table was created: two traces a minute apart came back
+    # "STABLE: every trace took the same path". True of the traces, and read as a verdict
+    # about the day. Fewer than MIN_RUN agreeing traces establish nothing.
+    put("twice", 2, A)
+    put("twice", 1, A)
+    t = net_memory.route_history("twice", 1)
+    ok &= check("two agreeing traces: the same path, not STABLE",
+                "SAME PATH in all 2 traces, too few" in t and "STABLE" not in t)
 
     # --- retention: beyond the raw window only the traces where the route DIFFERED survive
     old = NOW - (net_store.RAW_RETENTION_DAYS + 3) * 86400

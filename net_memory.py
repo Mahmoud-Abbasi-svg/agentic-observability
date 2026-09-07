@@ -1457,9 +1457,19 @@ def route_history(target: str, days: float = 7.0) -> str:
 
     if len(classes) == 1:
         silent = sum(1 for r in recs if "*" in r[1].split(" "))
-        out.append(f"STABLE: every trace took the same path"
-                   + (f" ({silent} of {len(recs)} had a hop that did not answer; that is the "
-                      f"same hop, not a different route)" if silent else ""))
+        # The same rule as the sequential branch: a path is established by MIN_RUN traces.
+        # Two traces a minute apart agreeing is not "stable", it is two traces - and STABLE
+        # on the live database's first cycle read as a verdict about the day.
+        if len(recs) < MIN_RUN:
+            out.append(f"SAME PATH in all {len(recs)} traces, too few to call it established "
+                       f"({MIN_RUN} needed): nothing yet about whether the route holds")
+        else:
+            # Scoped to the span the traces cover: three traces in five minutes establish
+            # five minutes, and "STABLE" alone was read as a statement about the day.
+            out.append(f"STABLE over {_fmt_dur(recs[-1][0] - recs[0][0])}: every trace took "
+                       f"the same path"
+                       + (f" ({silent} of {len(recs)} had a hop that did not answer; that is "
+                          f"the same hop, not a different route)" if silent else ""))
         out += show(classes[0], 0)
         out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days)
         return "\n".join(out)
