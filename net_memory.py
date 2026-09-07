@@ -821,9 +821,15 @@ def coverage(hours: float = 24.0, target: str = "") -> str:
             el = _elsewhere(other, a, b)
             note = ""
             if el:
-                moved += 1
-                note = (f"  <- collector was running on {el[0]!r} "
-                        f"({el[3]} cycles); not down, elsewhere")
+                cov, rest, frac = _elsewhere_share(el, a, b)
+                if frac >= 0.8:
+                    moved += 1
+                    note = (f"  <- collector was running on {el[0]!r} "
+                            f"({el[3]} cycles); not down, elsewhere")
+                else:
+                    note = (f"  <- only {_fmt_dur(cov)} of it is the collector on {el[0]!r} "
+                            f"({el[3]} cycles); the other {_fmt_dur(rest)} was measured "
+                            f"nowhere at all")
             out.append(f"    {time.strftime('%d %b %H:%M', time.localtime(a))} -> "
                        f"{time.strftime('%d %b %H:%M', time.localtime(b))}  "
                        f"({(b - a) / 3600:.1f} h){note}")
@@ -908,6 +914,21 @@ def _elsewhere(other: list[tuple], a: float, b: float,
     return (label, lo, hi, n) if n >= min_beats else None
 
 
+def _elsewhere_share(el: tuple, a: float, b: float) -> tuple[float, float, float]:
+    """(seconds the other network accounts for, seconds still unexplained, fraction covered).
+
+    Naming another network explains only the part of the gap that network was actually being
+    measured in. Over a 180-day window a five-day stint elsewhere was reported as though it
+    covered the lot, and the agent read it back as "the collector was running on a different
+    network for most of it" - six months explained by five days. An answer to "why is there no
+    data" must not absorb more of the gap than it accounts for.
+    """
+    _label, lo, hi, _n = el
+    covered = max(0.0, hi - lo)
+    span = max(1e-9, b - a)
+    return covered, max(0.0, span - covered), covered / span
+
+
 def _gap_reason(r: dict, now: float) -> str:
     """Why nothing was measured here - the monitor down, the monitor elsewhere, or this host
     skipped while the monitor ran."""
@@ -922,8 +943,8 @@ def _gap_reason(r: dict, now: float) -> str:
                f"{_fmt_t(hi, now)} ({n} cycles), not on this one")
         # Naming the other network must not quietly account for the whole gap when it covers
         # only part of it. The unexplained remainder is still unobserved time.
-        rest = (r["end"] - r["start"]) - (hi - lo)
-        if rest > 0.2 * (r["end"] - r["start"]):
+        _cov, rest, frac = _elsewhere_share(el, r["start"], r["end"])
+        if frac < 0.8:
             why += f"; the other {_fmt_dur(rest)} is unaccounted for"
         return why
     if r["beats"] == 0:

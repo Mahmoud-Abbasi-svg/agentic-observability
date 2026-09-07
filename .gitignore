@@ -21,6 +21,11 @@ net_alerts.log
 net_history.jsonl
 net_eval_results*.json
 net_eval_stopping.json
+# Per-scenario runs (net_eval.py --save). Eval artefacts hold the agent's full answers, which
+# quote the SSID, the gateway address and this machine's local IPs - the same identifiers the
+# database is kept out of the repo for. net_eval_results*.json alone did not match a --save
+# under any other name.
+eval_*.json
 
 # Local configuration: may name internal hosts. monitor.example.json is tracked.
 monitor.json

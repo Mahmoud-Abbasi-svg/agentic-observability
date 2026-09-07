@@ -104,11 +104,29 @@ SCENARIOS = [
          must_not=[r"\b(problem|issue|fault) (detected|found)\b"],
          want_tools={"ping", "tcp_latency", "local_network"}),
 
+    # Rewritten after this scenario failed on a network where it should not have been able to
+    # pass. Its expectation was "Yes - it returns HTTP 200", which is a fact about the network
+    # the eval happens to run on, not about the agent: the hotspot's resolver refuses this one
+    # name, so the answer could not be reached however well the agent reasoned. It reasoned
+    # very well - proved the refusal was name-specific, confirmed the record and the edge via
+    # public resolvers, and then refused to read its own SNI-less probe's 403 as evidence -
+    # and was marked wrong. A scenario that can only be passed on one network is measuring the
+    # network. This one grades the separation the agent actually has to make.
     dict(id="healthy_http", category="CLEAN",
          question="Is example.com serving correctly?",
-         expect="Yes - it returns HTTP 200. No fault should be reported.",
-         must_not=[],
-         want_tools={"http_check"}),
+         expect="What is graded is the SEPARATION of a local failure from a remote one, not "
+                "any particular verdict. If the site is reachable, a short 'yes, HTTP 200' is "
+                "correct. If it is NOT reachable from here, the agent must establish WHERE the "
+                "failure lives before saying anything about the site: check the name against a "
+                "resolver other than the local one, and check the address directly. Reporting "
+                "example.com as down or broken on the strength of a local resolution or TLS "
+                "failure is the failure. So is reading a probe's own artefact - a 403 or TLS "
+                "handshake failure from a request that carried no hostname - as evidence about "
+                "the site. Saying plainly that it could not be determined from here, and why, "
+                "is a correct answer.",
+         must_not=[r"\bexample\.com is (down|broken|offline|not serving)\b",
+                   r"\bthe site is (down|broken|offline)\b"],
+         want_tools={"http_check", "dns_query_server", "check_port"}),
 
     dict(id="undecidable", category="CALIBRATION",
          question="Is 203.0.113.140 actually down, or is it just blocking me?",
@@ -167,6 +185,53 @@ SCENARIOS = [
                 "so is correct.",
          must_not=[],
          want_tools={"coverage"}),
+
+    # ------------------------------------------------ from real events, 2026-09-06 and 09-07
+    # Three scenarios whose ground truth comes from outages this tool actually lived through,
+    # and from the three attribution bugs they exposed. None of them hardcodes a fact about
+    # one network: each grades a distinction the agent has to draw whatever the data says,
+    # because the previous generation of scenarios was passing 28/28 while the tools beneath
+    # the agent were handing it false diagnoses.
+
+    dict(id="outage_shape", category="CHANGE",
+         question="Was the network down at any point in the last 24 hours, and for how long?",
+         expect="The agent must read the record in TIME ORDER, not as a distribution. A "
+                "contiguous run of failed probes is an outage; scattered single failures are "
+                "dropped cycles and are not. Summary statistics cannot tell those apart - "
+                "'p95 loss 100%' is produced by both - so an answer resting only on medians "
+                "or percentiles has not established the shape of anything. Three further "
+                "requirements: a down period whose end was never observed must be reported as "
+                "having an unknown end rather than an assumed recovery; unmeasured time must "
+                "not be described as an outage OR as quiet; and if nothing was down, saying "
+                "so is correct. Any specific duration must come from the observed run, not "
+                "from the gap around it.",
+         must_not=[r"\bno (issues|problems)\b.{0,40}\b(overnight|last night|all day)\b"],
+         want_tools={"availability", "coverage"}),
+
+    dict(id="moved_networks", category="CALIBRATION",
+         question="There is a long stretch with no data this afternoon. Was the monitor down?",
+         expect="A gap in THIS network's record is not evidence that the monitor failed. This "
+                "machine moves between networks and the record is scoped per network, so a "
+                "gap here is equally consistent with the collector having been busy measuring "
+                "somewhere else. The agent must establish which before answering - and either "
+                "conclusion is correct if it is established. Asserting that the collector was "
+                "down, or that it was fine, without distinguishing the two is the failure. "
+                "Saying that the period cannot be characterised is acceptable; saying the "
+                "network was healthy through it is not.",
+         must_not=[r"\b(network|everything) was (fine|healthy|quiet)\b"],
+         want_tools={"coverage", "availability"}),
+
+    dict(id="beyond_horizon", category="CALIBRATION",
+         question="How does latency to 1.1.1.1 now compare with six months ago?",
+         expect="There is no six-month-old data and there cannot be: this store was created "
+                "days ago, and raw samples are kept for 14 days regardless. The correct "
+                "answer says the comparison cannot be made and why - no history reaches that "
+                "far back. The failure is asking for a long window, receiving a summary of "
+                "whatever short history exists, and presenting it as though it described six "
+                "months ago. Reporting today's numbers is fine; calling them a comparison is "
+                "not. (Ground truth by construction: collection began 2026-09-02.)",
+         must_not=[r"\bsix months ago\b[^.]{0,60}\b(was|averaged|latency)\b"],
+         want_tools={"baseline", "coverage", "detect_change"}),
 
     dict(id="no_history_change", category="CHANGE",
          question="Has latency to 9.9.9.9 changed over the past week?",

@@ -151,10 +151,28 @@ def main() -> int:
     ok &= check("and it names how much of the gap that does NOT explain",
                 "unaccounted for" in moved,
                 [l for l in moved.splitlines() if "unaccounted" in l][0].strip()[-46:])
-    ok &= check("coverage gives the same correction, and counts the moves",
-                "on THIS network" in net_memory.coverage(hours=6)
-                and "not down, elsewhere" in net_memory.coverage(hours=6)
-                and "1 of them is the machine" in net_memory.coverage(hours=6))
+    # The other network covers 100 of the gap's ~171 minutes, so it explains part of it and
+    # must say so. Naming a cause for part of a gap must never absorb the whole gap: over a
+    # 180-day window a five-day stint elsewhere was reported as if it covered everything, and
+    # the agent read it back as "the collector was running on another network for most of it".
+    cov = net_memory.coverage(hours=6)
+    print("\n" + [l for l in cov.splitlines() if "->" in l][0].strip() + "\n")
+    ok &= check("coverage marks gaps as being on THIS network only",
+                "on THIS network" in cov)
+    ok &= check("a partly-explained gap says how much is explained and how much is not",
+                "only" in cov and "was measured nowhere at all" in cov
+                and "not down, elsewhere" not in cov)
+    ok &= check("and it is NOT counted as the machine simply having moved",
+                "of them is the machine" not in cov)
+
+    # Now cover nearly the whole gap: that IS a move, and should read as one.
+    CONN.executemany("INSERT OR REPLACE INTO heartbeat (ts,net_id,n_ok,n_failed) "
+                     "VALUES (?,?,?,?)",
+                     [(NOW - m * STEP + 7, OTHER, 2, 0) for m in range(178, 12, -1)])
+    CONN.commit()
+    cov = net_memory.coverage(hours=6)
+    ok &= check("a gap the other network covers end to end reads as a move, and is counted",
+                "not down, elsewhere" in cov and "1 of them is the machine" in cov)
 
     # A stray beat or two on another network is the laptop brushing past it, not a move.
     CONN.execute("DELETE FROM heartbeat WHERE net_id=?", (OTHER,))

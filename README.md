@@ -309,6 +309,18 @@ Three things in that output were each got wrong once before they were got right:
 
   The 7.1 h is the machine asleep, and it stays unclaimed. Fewer than three heartbeats
   elsewhere is the laptop brushing past a network, not a move, and does not excuse a gap.
+- **And naming the other network must not absorb more of the gap than it covers.** The first
+  version of that fix reported the other network with a raw cycle count and no proportion, so
+  over a 180-day window a five-day stint elsewhere read as the explanation for the lot — and
+  the agent duly wrote *"the collector was running on a different network for most of it."*
+  Six months explained by five days. Both tools now quote the share:
+
+  ```
+  11 Mar 23:36 -> 06 Sep 19:44  (4291.1 h)  <- only 47.7 h of it is the collector on
+  'AirInstitute' (1021 cycles); the other 4243.5 h was measured nowhere at all
+  ```
+
+  Found by an eval run, one day after shipping the fix it corrects.
 
 ## The monitor
 
