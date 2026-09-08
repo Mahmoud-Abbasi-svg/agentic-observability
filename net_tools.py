@@ -460,6 +460,16 @@ def http_check(url: str) -> str:
     except Exception as e:
         ms = (time.perf_counter() - t0) * 1000
         cause = e.reason if isinstance(e, urllib.error.URLError) else e
+        if isinstance(cause, socket.gaierror):
+            # The name did not resolve, so the site was never contacted. This was reported as
+            # FAILED like any other failure, and the store filed it as reachable=0: on the
+            # hotspot, whose resolver refuses example.com, the 48 h report then showed
+            # "https://example.com down 2.0 h" for a site that had never been asked. The DNS
+            # probes carry the resolution failure; this one says nothing about the site.
+            return (f"url={url} UNRESOLVED after_ms={ms:.1f} (the name did not resolve, so the "
+                    f"site was never contacted; this says nothing about whether it is up. "
+                    f"Check dns_lookup for the name and local_network for which resolver "
+                    f"answered. {cause})")
         if isinstance(cause, ssl.SSLCertVerificationError):
             # The first version reported this as "FAILED ... certificate has expired" for
             # certificates that were valid, because the failure was in the local store. An

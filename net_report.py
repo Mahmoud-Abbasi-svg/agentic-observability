@@ -225,7 +225,7 @@ def _alerts_table(conn, now: float, current_net: str) -> str:
                 f'when it was last checked, not now. A signal on a network this machine has '
                 f'left cannot be re-evaluated until it returns.</p>')
     return ('<div class="card"><table><tr><th>target</th><th>metric</th><th>state</th>'
-            '<th>in state</th><th>freshness</th><th>network</th></tr>'
+            '<th>since</th><th>freshness</th><th>network</th></tr>'
             + "".join(body) + "</table>" + note + "</div>")
 
 

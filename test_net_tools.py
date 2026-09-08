@@ -119,6 +119,24 @@ def main() -> int:
                     "without a verdict either way",
                     "FAILED" in out and "not trusted here" not in out
                     and "local CA gap" not in out)
+
+        # A name that does not resolve was never contacted. The 48 h report showed
+        # "https://example.com down 2.0 h" on a hotspot whose resolver refuses that one name,
+        # because the failure was stored as reachable=0 like a site that answered nothing.
+        import socket as _s
+
+        def unresolved(*_a, **_k):
+            raise urllib.error.URLError(_s.gaierror(11001, "getaddrinfo failed"))
+
+        urllib.request.urlopen = unresolved
+        out = net_tools.http_check("https://example.com")
+        ok &= check("a name that does not resolve is UNRESOLVED, not FAILED, and says the site "
+                    "was never contacted",
+                    out.startswith("url=https://example.com UNRESOLVED") and "FAILED" not in out
+                    and "never contacted" in out)
+        import net_memory as _nm
+        ok &= check("and the store records nothing about the site for it",
+                    _nm.extract_metrics("http_check", out) == {})
     finally:
         urllib.request.urlopen = real_urlopen
 

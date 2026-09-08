@@ -142,6 +142,8 @@ def extract_metrics(tool: str, text: str) -> dict[str, float]:
             m["path_hops"] = float(len(p["hops"]))
             m["path_reached"] = 1.0 if p["reached"] else 0.0
     elif tool == "http_check":
+        if re.match(r"url=\S+ UNRESOLVED\b", text or ""):
+            return m                # never contacted: nothing to say about the site
         st, el = _f(r"status=([0-9]+)", text), _f(r"elapsed_ms=([0-9.]+)", text)
         if st is not None:
             m["http_status"] = st
