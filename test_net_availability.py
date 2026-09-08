@@ -189,6 +189,23 @@ def main() -> int:
                 "being down",
                 "office-wifi" not in net_memory.availability("gw", hours=6))
 
+    # ---------------------------------------------------------------- intermittent collector
+    # Live, 2026-09-08: the collector started at logon, probed every host once, died, and was
+    # run once by hand six minutes later. Two heartbeats in six minutes cleared the "running"
+    # threshold and the gap read "collector ran but did not probe this host" - it had probed
+    # the host, then stopped. Four of ~15 expected cycles is intermittent, and must say so.
+    for m in list(range(60, 54, -1)) + list(range(40, 34, -1)):
+        put("crash", m, True)
+    for m in (52, 49, 46, 43):
+        beat(m)
+    CONN.commit()
+    crash = net_memory.availability("crash", hours=6)
+    line = [l for l in crash.splitlines() if "NOT MEASURED" in l and "15 min" in l]
+    ok &= check("a collector present for a fraction of its cycles is called intermittent, "
+                "not running-and-skipping",
+                line and "intermittent" in line[0] and "did not probe" not in line[0],
+                line[0].strip()[-75:] if line else crash[:120])
+
     # ---------------------------------------------------------------- read from a thread
     # net_eval runs scenarios concurrently and net_memory cached ONE sqlite connection, so the
     # second thread to ask for history got "SQLite objects created in a thread can only be

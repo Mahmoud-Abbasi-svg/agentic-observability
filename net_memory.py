@@ -1025,6 +1025,15 @@ def _gap_reason(r: dict, now: float) -> str:
     running_here = not (r["beats"] == 0
                         or (r["expected"] > 0 and r["beats"] / r["expected"] < 0.25))
     if running_here:
+        # Two heartbeats in six minutes clear the threshold above, and on live data that read
+        # "collector ran but did not probe this host" for a stretch in which the collector
+        # started, ran one cycle, died, and was run once by hand. It DID probe the host; it
+        # then stopped. A collector present for a fraction of its expected cycles is
+        # intermittent, which is a different fact from one that ran throughout and skipped
+        # the host - the second was true once, and is what the wording was written for.
+        if r["expected"] > 0 and r["beats"] / r["expected"] < 0.8:
+            return (f"collector ran only {r['beats']} of ~{r['expected']:.0f} expected "
+                    f"cycles here - intermittent, not running throughout")
         return f"collector ran {r['beats']} cycles but did not probe this host"
     el = r.get("elsewhere")
     if el:
