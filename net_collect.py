@@ -263,4 +263,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    net_store.install_crash_log("net_collect")
     raise SystemExit(main())

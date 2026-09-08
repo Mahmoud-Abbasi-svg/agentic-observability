@@ -54,6 +54,7 @@ venv/
 # published the gateway MAC and SSID inside it. Anything that starts with the database name
 # or carries a backup suffix stays local.
 net_monitor.db*
+*.crash.log
 *.bak
 *.bak-*
 *.bak.*

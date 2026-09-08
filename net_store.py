@@ -141,6 +141,35 @@ CREATE TABLE IF NOT EXISTS net (
 """
 
 
+def install_crash_log(name: str) -> str:
+    """Write an uncaught exception's traceback beside the database before the process dies.
+
+    The scheduled tasks run under pythonw, which has no stderr, so a daemon that crashes
+    leaves exactly one trace: exit code 1 in Task Scheduler. On 2026-09-08 both the collector
+    and the evaluator died within a minute of logon, and afterwards nothing on the machine
+    could say why - reproducing the simultaneous start did not reproduce the crash. A monitor
+    that stops silently is the worst failure this project has, and "it stopped" with no reason
+    attached is not something a fix can be built on. The log is appended to, timestamped,
+    and lives with the data it was protecting.
+    """
+    import sys
+    import traceback
+    log = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), f"{name}.crash.log")
+
+    def hook(exc_type, exc, tb):
+        try:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')}  pid {os.getpid()}\n")
+                f.write("".join(traceback.format_exception(exc_type, exc, tb)))
+        except OSError:
+            pass
+        if sys.stderr is not None:
+            sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = hook
+    return log
+
+
 def connect(path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=15)
     conn.execute("PRAGMA journal_mode=WAL")       # survives a hard stop mid-write
