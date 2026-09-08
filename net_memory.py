@@ -1283,7 +1283,12 @@ def availability(target: str = "", hours: float = 24.0) -> str:
 # produce is named for what it is before any change is claimed.
 
 MIN_RUN = 3            # consecutive traces before a path counts as established
-ROTATION_RATE = 0.05   # transitions per trace above which alternation, not change, is read
+# Transitions per trace above which alternation, not change, is read. Load balancing flips
+# the path at trace cadence: even an 80/20 split switches about every third trace. The
+# first value here, one switch per twenty traces, let five carrier reroutes in a day - runs
+# of two hours each - be called "what per-flow load balancing looks like". A switch every
+# twelve traces is a route that keeps changing, and the timeline should show each change.
+ROTATION_RATE = 0.25
 # ...but only once there are enough transitions for a rate to mean anything. The first real
 # route change this tool saw - hop 4 moved across a shutdown, thirteen traces on the old
 # path and seven on the new - was ONE switch in twenty traces: 0.053, just over the rate,

@@ -248,6 +248,19 @@ def main() -> int:
     ok &= check("one switch in twenty consecutive traces is a CHANGE",
                 "CHANGED 1 time(s)" in t and "ALTERNATING" not in t)
 
+    # --- live, 2026-09-08 22:32: five switches in 59 traces on the hotspot, runs of about
+    # twelve traces - two hours each - and the verdict was ALTERNATING, "what per-flow load
+    # balancing looks like". Load balancing flips at trace cadence; a route that holds for
+    # two hours at a time and then moves has CHANGED, each time, and the timeline must say
+    # when. The rate that separates them is a switch every few traces, not every twenty.
+    seq = [A] * 12 + [B] * 11 + [A] * 12 + [C] * 12 + [B] * 12
+    for i, addrs in enumerate(seq):
+        put("reroutes", len(seq) - i, addrs)
+    t = net_memory.route_history("reroutes", 1)
+    ok &= check("five switches in 59 traces with two-hour runs is CHANGED, not ALTERNATING",
+                "CHANGED 4 time(s)" in t and "ALTERNATING" not in t,
+                t.splitlines()[1][:70])
+
     # --- the latest traces are on a new path but too few to be established
     for i in range(50, 2, -1):
         put("fresh", i, A)
