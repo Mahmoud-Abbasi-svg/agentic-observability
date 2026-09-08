@@ -237,6 +237,32 @@ def main() -> int:
                 and "within their own noise: rtt_avg_ms" in t
                 and "probe types DISAGREE" in t, [l for l in t.splitlines() if "moved" in l][0])
 
+    # --- a single reading is not a window ----------------------------------------------
+    # Live, 2026-09-08 22:48: an 87-minute outage, the gateway answering once in an hour,
+    # and that one 430 ms reply fired "+10138%" as a window of one against single-sample
+    # placebos, then confirmed itself three evaluations running on the same sample.
+    now = int(time.time())
+    CONN.execute("DELETE FROM sample WHERE target='lonely'")
+    CONN.executemany(
+        "INSERT OR REPLACE INTO sample (ts,target,metric,value,net_id) VALUES (?,?,?,?,?)",
+        [(now - 10 * 3600 + i * 60, "lonely", "rtt_avg_ms", 4.0 + (i % 5) * 0.1, NET)
+         for i in range(400)])                                  # 10 h .. 3.3 h ago, quiet
+    CONN.execute("INSERT OR REPLACE INTO sample (ts,target,metric,value,net_id) "
+                 "VALUES (?,?,?,?,?)", (now - 60, "lonely", "rtt_avg_ms", 430.0, NET))
+    CONN.commit()
+    a = net_memory.assess("lonely", "rtt_avg_ms", recent_hours=2.0, baseline_days=1)
+    ok &= check("one recent sample, however extreme, gives NO verdict",
+                a["status"] == "insufficient" and "single reading is not a window" in a["reason"],
+                a["reason"][:80])
+    CONN.executemany(
+        "INSERT OR REPLACE INTO sample (ts,target,metric,value,net_id) VALUES (?,?,?,?,?)",
+        [(now - 180, "lonely", "rtt_avg_ms", 410.0, NET),
+         (now - 120, "lonely", "rtt_avg_ms", 450.0, NET)])
+    CONN.commit()
+    a = net_memory.assess("lonely", "rtt_avg_ms", recent_hours=2.0, baseline_days=1)
+    ok &= check("three recent samples that agree are a window, and the shift is real",
+                a["status"] == "ok" and a["exceeds"], a.get("reason", "")[:60])
+
     # --- refuted claims are agreement, not contradiction -----------------------------------
     # Found on the first change-question answer: the agent wrote "a 5% increase would be
     # completely undetectable here", which says exactly what the floor says, and the verifier

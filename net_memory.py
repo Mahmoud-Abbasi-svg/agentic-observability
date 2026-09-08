@@ -52,6 +52,9 @@ _TARGET_KEYS = ("host", "server", "url", "name")
 # "95th pct of 5 placebo windows", and the evidence in the alert is what exposed it.
 MIN_PLACEBO_WINDOWS = 20
 
+# The smallest recent window a verdict may rest on. One reading is a sample, not a window.
+MIN_RECENT = 3
+
 # Effect sizes searched when reporting the minimum detectable shift. Shared by detect_change
 # and can_detect so the two can never quote different resolutions for the same signal.
 _MDE_GRID = [0.02, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.00, 1.50, 2.00]
@@ -490,6 +493,18 @@ def assess(target: str, metric: str = "rtt_avg_ms", recent_hours: float = 2.0,
         r["reason"] = (f"{target}/{metric} {where}: no measurements in the last "
                        f"{recent_hours:g} h, so there is nothing recent to compare. Take a "
                        f"fresh measurement first.")
+        return r
+    if len(recent) < MIN_RECENT:
+        # A single reading is not a window. During tonight's 87-minute outage one stray
+        # 430 ms reply from the gateway - the only sample in an hour of silence - was
+        # compared as a window of one against single-sample placebos, came out at +10138%,
+        # and fired an alert that "confirmed" itself on that same sample three evaluations
+        # running. The fact of that hour was unreachability; a latency verdict on one reply
+        # is not a fact about latency at all.
+        r["reason"] = (f"{target}/{metric} {where}: only {len(recent)} recent sample(s) in the "
+                       f"last {recent_hours:g} h. A single reading is not a window - nothing "
+                       f"distinguishes a change from one stray reply. {MIN_RECENT} are needed; "
+                       f"if the host has mostly not been answering, availability is the tool.")
         return r
     if len(base) < 6:
         r["reason"] = (f"{target}/{metric} {where}: {len(recent)} recent samples but only "
