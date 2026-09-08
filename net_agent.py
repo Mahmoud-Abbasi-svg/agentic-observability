@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Optional
 
 import net_memory
@@ -127,6 +128,14 @@ it says a shift is not distinguishable from noise, do NOT then describe the shif
 degradation because the number happens to be higher. It also reports the smallest shift the \
 current history could resolve; when a change is too small to call, say that, and say what \
 more measurement would be needed.
+
+A host is measured here by several probe types - ping, TCP handshake, DNS query, HTTP - and \
+they do not have to agree. Before calling a HOST faster or slower, run detect_change with \
+metric="all": on this machine ping to 1.1.1.1 was 30% faster than baseline while the TCP \
+handshake and DNS query to the same host were 40% slower, and an answer given from ping \
+alone was wrong about the host. When the probe types disagree, say which protocol moved; do \
+not average them into one verdict, and do not point away from a host whose other signals \
+you have not looked at.
 
 9. Know the limits of your own instrument, and say so instead of implying an all-clear. A \
 "no change detected" result means one of two very different things: nothing happened, or \
@@ -267,12 +276,33 @@ You have {remaining} measurement steps left. When they run out you must answer w
 have, saying plainly what remained undetermined."""
 
 
+_SYSTEM_FILE: Optional[str] = None
+
+
+def _system_prompt_file() -> str:
+    """The system prompt, in a file, because it no longer fits on the command line.
+
+    `claude` is installed as a .cmd wrapper, so argv passes through cmd.exe and its 8191
+    character limit. The prompt crossed that at 8283 characters on 2026-09-08, with the rule
+    about hosts having several probe types, and every question then died with "The command
+    line is too long". Written once per process to a temp file and passed by path.
+    """
+    global _SYSTEM_FILE
+    if _SYSTEM_FILE is None or not os.path.exists(_SYSTEM_FILE):
+        fd, path = tempfile.mkstemp(prefix="net_agent_system_", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(SYSTEM)
+        _SYSTEM_FILE = path
+    return _SYSTEM_FILE
+
+
 def _claude_cli(prompt: str, timeout: int = 600) -> str:
     """One stateless call to the installed `claude` CLI.
 
-    Three things here are load-bearing, learned the hard way:
+    Four things here are load-bearing, learned the hard way:
       * the prompt goes on STDIN - passed as argv, cmd.exe mangles embedded quotes and the
         model silently receives a truncated prompt
+      * the system prompt goes in a FILE - see _system_prompt_file
       * `--tools ""` disables Claude Code's own tools, so it cannot wander off and read files
         or fetch URLs instead of answering with our protocol
       * `--output-format json` gives a parseable envelope; `.result` holds the text
@@ -281,7 +311,7 @@ def _claude_cli(prompt: str, timeout: int = 600) -> str:
         raise RuntimeError("the `claude` CLI was not found; set NET_AGENT_CLAUDE_BIN")
     p = subprocess.run(
         [CLAUDE_BIN, "-p", "--model", MODEL, "--tools", "",
-         "--system-prompt", SYSTEM, "--output-format", "json"],
+         "--system-prompt-file", _system_prompt_file(), "--output-format", "json"],
         input=prompt, capture_output=True, text=True, timeout=timeout,
         encoding="utf-8", errors="replace")
     if p.returncode != 0:

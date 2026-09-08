@@ -59,7 +59,8 @@ RISE = (r"rose|rise|risen|up|increased?|climbed|grew|jumped|higher|worse|worsene
         r"slower|slowed")
 FALL = (r"fell|fall|fallen|down|decreased?|dropped|declined|shrank|lower|better|improved|"
         r"faster|sped up")
-CHANGE = rf"{RISE}|{FALL}|changed|shifted|moved|differs?|deviated"
+CHANGE = (rf"{RISE}|{FALL}|changed|shifted|moved|differs?|deviated|"
+          r"(?:above|below|over|under)\s+(?:the\s+|its\s+)?(?:baseline|normal|usual|median)")
 
 # Which stored metric a phrase is talking about. Order matters: the first match wins, so the
 # more specific words come first ("handshake time" must not be read as generic latency).
@@ -168,7 +169,11 @@ def _metric_for(text: str, pos: int) -> str:
 # contained "a MINUS-SIGN 20% shift" using U+2212, which `[+-]` cannot match, and the report
 # then said "no claims of change found" over an answer full of them. Mapped 1:1 so that
 # character offsets - and therefore host attribution - stay correct.
-_DASHES = {0x2212: "-", 0x2013: "-", 0x2014: "-", 0x2010: "-", 0x2011: "-"}
+_DASHES = {0x2212: "-", 0x2013: "-", 0x2014: "-", 0x2010: "-", 0x2011: "-",
+           # Markdown emphasis. A live answer wrote "30.8% *below* baseline" and the report
+           # found no claim in it: the asterisks sat between the number and the word the
+           # pattern needed next to it. Mapped to a space, 1:1, so offsets still hold.
+           0x2A: " "}
 
 # A sentence ends only where punctuation is followed by space or end of text. "12.6" and
 # "1.1.1.1" must not be treated as three sentences each.

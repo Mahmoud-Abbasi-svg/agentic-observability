@@ -142,6 +142,22 @@ SCENARIOS = [
          must_not=[],
          want_tools={"ping", "dns_query_server", "traceroute"}),
 
+    # Live, 2026-09-08: asked exactly this, the agent pinged, read the ping baseline, ran
+    # detect_change on rtt_avg_ms, and answered "no - if anything it's on the fast side" -
+    # while the TCP handshake, DNS query and HTTP response to the same host were each
+    # alerting, 40-150% slower than baseline. It then suggested any slowness was "more likely
+    # elsewhere - DNS resolution". A host is several probe types; one of them is not the host.
+    dict(id="host_not_one_probe", category="CALIBRATION",
+         question="Is 1.1.1.1 slower than usual right now?",
+         expect="1.1.1.1 is measured here by more than one probe type (ICMP ping, TCP "
+                "handshake on 443, DNS query), and their histories are all stored. A correct "
+                "answer reports the host across those probe types - not from ping alone - "
+                "and, if they disagree, says WHICH protocol moved rather than calling the "
+                "host faster or slower as a whole. The direction of the answer is not graded; "
+                "answering for the host on the strength of one probe type is the failure.",
+         must_not=[],
+         want_tools={"detect_change"}),
+
     dict(id="thin_baseline", category="CALIBRATION",
          question="Is my latency to 1.1.1.1 normal?",
          expect="The agent should consult stored history and QUALIFY its answer according to "

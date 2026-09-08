@@ -141,6 +141,32 @@ That last line is the one that earns its place. When a change is too small to ca
 says so **and** says what size of change it could have resolved — so "I can't tell" comes with
 the reason and the remedy, instead of a verdict the data cannot support.
 
+**A host is not one number.** Asked *"is 1.1.1.1 slower than usual?"* on 2026-09-08, the agent
+pinged, read the ping baseline, ran `detect_change` on the ping round-trip and answered *"no —
+if anything it's on the fast side"* — then suggested any slowness was *"more likely elsewhere —
+DNS resolution"*. Seven hours earlier the TCP handshake, the DNS query and the HTTP response to
+that same host had each been 40–150% slower than baseline and beyond their own floors while
+ping was 42% *faster*; the carrier treats ICMP differently from TCP. An answer about a host
+that rests on one protocol is an answer about that protocol. So `detect_change` takes
+`metric="all"` and puts every probe type side by side:
+
+```
+1.1.1.1 on network 'hotspot': every probe type, recent 2 h vs the 7 d before
+  metric              baseline    recent    shift   floor   verdict
+  rtt_avg_ms              63.6      43.8     -31%     50%  within noise
+  handshake_avg_ms        74.8      47.9     -36%     69%  within noise
+  query_ms                86.8      41.1     -53%     91%  within noise
+  ...
+  The probe types DISAGREE. The host is not 'faster' or 'slower' as a whole; say which
+  protocol moved.
+```
+
+(The last line appears only when they do disagree.) The prompt now says to call it before
+calling a host faster or slower, and an eval scenario grades exactly that: the direction of
+the answer is not scored, answering for the host from one probe type is the failure. Asked
+the same question again, the agent reached for `metric="all"` first and reported each
+protocol against its own floor.
+
 Two implementation notes:
 
 **Placebo windows are contiguous, not random subsets.** Measurements adjacent in time are

@@ -211,6 +211,32 @@ def main() -> int:
                 f and f[0].claim.metric == "query_ms" and g and g[0].claim.metric == "query_ms",
                 f"{[x.claim.metric for x in f + g]}")
 
+    # --- markdown emphasis and "below baseline" ------------------------------------------
+    # Live: "The recent window is 30.8% *below* baseline, but that shift is not
+    # distinguishable from noise" - and the verifier reported no claims at all. Two misses
+    # in one sentence: the asterisks between the number and the word, and "below baseline"
+    # not being a change verb. Both fixed; the sentence is a refuted claim, so AGREED.
+    v = net_verify.verify("The recent window to noisy-path is 8.4% *below* baseline, but "
+                          "that shift is **not distinguishable from noise** (p=0.36).")
+    ok &= check("a claim written with markdown emphasis is still found, and its own "
+                "refutation still read", v["n_claims"] == 1
+                and v["findings"][0].verdict == "AGREED",
+                f"{v['n_claims']} claim(s) {[f.verdict for f in v['findings']]}")
+
+    # --- every probe type on one host -----------------------------------------------------
+    # Live: asked "is 1.1.1.1 slower than usual", the agent answered from ping alone - "no,
+    # if anything faster" - while the TCP handshake and DNS query to the same host were
+    # alerting. detect_change(metric="all") puts every probe type side by side.
+    vals = [50.0 * (1 + rng.gauss(0, 0.05)) for _ in range(n)]
+    build("quiet-path", "query_ms", vals[:-120] + [v * 1.6 for v in vals[-120:]])
+    t = net_memory.detect_change("quiet-path", "all")
+    ok &= check("metric='all' lists every probe type on the host",
+                all(m in t for m in ("rtt_avg_ms", "handshake_avg_ms", "query_ms")))
+    ok &= check("and separates the one that moved from the ones that did not",
+                "moved beyond their own floor: query_ms (+" in t
+                and "within their own noise: rtt_avg_ms" in t
+                and "probe types DISAGREE" in t, [l for l in t.splitlines() if "moved" in l][0])
+
     # --- refuted claims are agreement, not contradiction -----------------------------------
     # Found on the first change-question answer: the agent wrote "a 5% increase would be
     # completely undetectable here", which says exactly what the floor says, and the verifier

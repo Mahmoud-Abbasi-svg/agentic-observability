@@ -577,6 +577,66 @@ def format_assessment(r: dict) -> str:
     return "\n".join(out)
 
 
+# One signal per probe type. rtt_min/rtt_max move with rtt_avg and would triple every
+# finding; the rest each describe a different protocol's experience of the same host.
+HOST_METRICS = ("rtt_avg_ms", "loss_pct", "reachable", "handshake_avg_ms", "query_ms",
+                "resolve_ms", "response_ms", "connect_ms", "success_rate", "ok_2xx")
+
+
+def _all_metrics(target: str, recent_hours: float, baseline_days: float) -> str:
+    """Every probe type's verdict on one host, side by side.
+
+    A host is not one number. On 2026-09-08 ping to 1.1.1.1 was 30% FASTER than its baseline
+    while the TCP handshake, the DNS query and the HTTP response to the same host were 40-150%
+    slower, each beyond its own floor - and the agent, asked whether the host was slower,
+    answered "no, if anything faster" from ping alone, then suggested the cause of any
+    slowness was "more likely elsewhere - DNS resolution". Three signals said otherwise and
+    none had been asked. The carrier treats ICMP differently from TCP; a verdict about a host
+    that rests on one protocol is a verdict about that protocol.
+    """
+    net = net_store.network_identity()
+    present = [m for (m,) in conn().execute(
+        "SELECT DISTINCT metric FROM sample WHERE target=? AND net_id=?",
+        (target, net["net_id"]))]
+    metrics = [m for m in HOST_METRICS if m in present]
+    if not metrics:
+        return (f"No history for {target!r} on network {net['label']!r}. Measure it first; "
+                f"there is nothing to compare against.")
+    out = [f"{target} on network {net['label']!r}: every probe type, recent {recent_hours:g} h "
+           f"vs the {baseline_days:g} d before",
+           f"  {'metric':<18}{'baseline':>10}{'recent':>10}{'shift':>9}{'floor':>8}   verdict"]
+    real, noise, unknown = [], [], []
+    for m in metrics:
+        r = assess(target, m, recent_hours, baseline_days)
+        if r["status"] != "ok":
+            unknown.append(m)
+            out.append(f"  {m:<18}{'':>10}{'':>10}{'':>9}{'':>8}   {r['reason'][:70]}")
+            continue
+        scale = 100.0 if r["relative"] else 1.0
+        unit = "%" if r["relative"] else ""
+        if r["exceeds"]:
+            real.append(f"{m} ({r['shift'] * scale:+.0f}{unit})")
+            verdict = "beyond its floor: REAL"
+        else:
+            noise.append(f"{m} ({r['shift'] * scale:+.0f}{unit})")
+            verdict = "within noise"
+        out.append(f"  {m:<18}{r['baseline_median']:>10.1f}{r['recent_median']:>10.1f}"
+                   f"{r['shift'] * scale:>+8.0f}{unit:<1}{r['noise_floor'] * scale:>7.0f}"
+                   f"{unit:<1}  {verdict}")
+    if real:
+        out.append(f"  moved beyond their own floor: {', '.join(real)}")
+    if noise:
+        out.append(f"  within their own noise: {', '.join(noise)}")
+    if unknown:
+        out.append(f"  not assessable yet: {', '.join(unknown)}")
+    if real and noise:
+        out.append("  The probe types DISAGREE. The host is not 'faster' or 'slower' as a "
+                   "whole; say which protocol moved. ICMP and TCP to one host have gone "
+                   "opposite ways on this machine.")
+    out.append("  For any one line's evidence, call detect_change with that metric.")
+    return "\n".join(out)
+
+
 def detect_change(target: str, metric: str = "rtt_avg_ms", recent_hours: float = 2.0,
                   baseline_days: float = 7.0) -> str:
     """Compare recent measurements of a host against its longer history, and say whether any
@@ -596,10 +656,16 @@ def detect_change(target: str, metric: str = "rtt_avg_ms", recent_hours: float =
 
     Args:
         target: Host, IP or URL, e.g. "1.1.1.1".
-        metric: Which metric to test, e.g. "rtt_avg_ms", "query_ms", "handshake_avg_ms".
+        metric: Which metric to test, e.g. "rtt_avg_ms", "query_ms", "handshake_avg_ms" -
+            or "all" for every probe type recorded on the host, side by side. Use "all"
+            whenever the question is about the HOST ("is 1.1.1.1 slower?") rather than one
+            probe: ping and TCP to the same host have moved in opposite directions here, and
+            an answer from ping alone was wrong about the host.
         recent_hours: How much of the tail counts as "recent".
         baseline_days: How far back the comparison history reaches.
     """
+    if metric.strip().lower() in ("all", "*", ""):
+        return _all_metrics(target, recent_hours, baseline_days)
     return format_assessment(assess(target, metric, recent_hours, baseline_days))
 
 
