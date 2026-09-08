@@ -1398,7 +1398,7 @@ def _letter(i: int) -> str:
 
 
 def _hop_table(recs: list[tuple], labels: list[int], cur: int, addrs: list[str],
-               now: float, days: float) -> list[str]:
+               now: float, days: float, recent_hours: float = PATH_RECENT_HOURS) -> list[str]:
     """Per-hop median round-trip on the current path, recent traces against the earlier ones.
 
     This is the half of the question the path classes cannot answer. The route being the same
@@ -1406,13 +1406,13 @@ def _hop_table(recs: list[tuple], labels: list[int], cur: int, addrs: list[str],
     sits. Only where - whether the rise is real against the path's own noise is detect_change's
     question, and the table does not pretend to answer it.
     """
-    cut = now - PATH_RECENT_HOURS * 3600
+    cut = now - recent_hours * 3600
     mine = [r for r, l in zip(recs, labels) if l == cur]
     recent = [r for r in mine if r[0] >= cut]
     before = [r for r in mine if r[0] < cut]
     if len(recent) < 2 or len(before) < 2:
         return [f"hop latency: not compared - {len(recent)} trace(s) on this path in the last "
-                f"{PATH_RECENT_HOURS:g} h and {len(before)} before that; at least 2 of each "
+                f"{recent_hours:g} h and {len(before)} before that; at least 2 of each "
                 f"are needed"]
 
     def medians(rs: list[tuple]) -> list[Optional[float]]:
@@ -1423,7 +1423,7 @@ def _hop_table(recs: list[tuple], labels: list[int], cur: int, addrs: list[str],
         return out
 
     mb, mr = medians(before), medians(recent)
-    out = [f"hop latency on path {_letter(cur)}, last {PATH_RECENT_HOURS:g} h "
+    out = [f"hop latency on path {_letter(cur)}, last {recent_hours:g} h "
            f"({len(recent)} traces) vs the earlier {len(before)} traces in the window, "
            f"medians:",
            f"  {'hop':>3}  {'address':<18}{'before':>8}{'recent':>8}   change"]
@@ -1471,7 +1471,8 @@ def _hop_table(recs: list[tuple], labels: list[int], cur: int, addrs: list[str],
     return out
 
 
-def route_history(target: str, days: float = 7.0) -> str:
+def route_history(target: str, days: float = 7.0,
+                  recent_hours: float = PATH_RECENT_HOURS) -> str:
     """Did the route to a host change, or did the same route get slower?
 
     A single traceroute shows today's path and cannot say whether it is the usual one. This
@@ -1502,6 +1503,7 @@ def route_history(target: str, days: float = 7.0) -> str:
     Args:
         target: Host or IP exactly as it was traced.
         days: How far back to read.
+        recent_hours: The tail compared against the rest in the per-hop latency table.
     """
     net = net_store.network_identity()
     now = time.time()
@@ -1555,7 +1557,7 @@ def route_history(target: str, days: float = 7.0) -> str:
                        + (f" ({silent} of {len(recs)} had a hop that did not answer; that is "
                           f"the same hop, not a different route)" if silent else ""))
         out += show(classes[0], 0)
-        out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days)
+        out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days, recent_hours)
         return "\n".join(out)
 
     if rate > ROTATION_RATE and transitions >= MIN_SWITCHES:
@@ -1581,7 +1583,7 @@ def route_history(target: str, days: float = 7.0) -> str:
                        + (f"; vs {_letter(0)}: {_path_diff(classes[0]['addrs'], c['addrs'])}"
                           if k else ""))
         out += show(classes[cur], cur)
-        out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days)
+        out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days, recent_hours)
         return "\n".join(out)
 
     # Sequential: runs of consecutive traces on one path. Established runs make the timeline;
@@ -1651,7 +1653,7 @@ def route_history(target: str, days: float = 7.0) -> str:
     out += timeline
     for k, c in enumerate(classes):
         out += show(c, k)
-    out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days)
+    out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days, recent_hours)
     return "\n".join(out)
 
 

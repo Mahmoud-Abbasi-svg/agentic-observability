@@ -1,0 +1,9 @@
+{
+  "targets": [
+    {"name": "server-ping", "kind": "ping", "host": "10.0.4.10", "count": 3, "interval_s": 5},
+    {"name": "server-path", "kind": "trace", "host": "10.0.4.10", "max_hops": 8, "interval_s": 10},
+    {"name": "server-tcp", "kind": "tcp", "host": "10.0.4.10", "port": 80, "attempts": 3, "interval_s": 10},
+    {"name": "server-http", "kind": "http", "host": "http://10.0.4.10/", "interval_s": 10},
+    {"name": "gateway", "kind": "ping", "host": "10.0.1.1", "count": 3, "interval_s": 5}
+  ]
+}

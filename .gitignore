@@ -55,6 +55,12 @@ venv/
 # or carries a backup suffix stays local.
 net_monitor.db*
 *.crash.log
+
+# containerlab runtime state: generated on deploy, holds a TLS CA private key and ssh keys
+lab/clab-obs/
+lab/.clab-obs/
+lab/*.db
+lab/*.log
 *.bak
 *.bak-*
 *.bak.*

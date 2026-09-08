@@ -1,0 +1,81 @@
+# A network whose answers are known, for testing the tools against ground truth.
+#
+#                 +-- r2 --+
+#   client -- r1 -+        +- r4 -- server
+#                 +-- r3 --+
+#
+# Four FRR routers running OSPF, every link cost 10, so r1 has two equal-cost paths to the
+# server's subnet. That is the trap route_history exists for: with per-flow hashing on r1
+# the path ALTERNATES trace by trace while nothing changes. Raise one link's cost and the
+# route CHANGES. Add delay on one link with netem and the same route gets SLOWER at a known
+# hop. Take the server's link down for a known number of minutes and availability has a DOWN
+# run of exactly that length to report. See lab.sh for the scenarios.
+#
+# The collector runs in `client` against the project directory mounted read-only at /app,
+# with its database on a volume at /data. Nothing here touches the machine's real network.
+name: obs
+
+mgmt:
+  network: obs-mgmt
+  ipv4-subnet: 172.31.250.0/24
+
+topology:
+  defaults:
+    kind: linux
+  kinds:
+    linux:
+      image: obs-client:latest
+  nodes:
+    client:
+      binds:
+        - "/mnt/j/Spain/Agentic Observability:/app:ro"
+        - /var/lib/obs-lab:/data
+      env:
+        NET_MONITOR_DB: /data/lab.db
+        NET_MONITOR_CONFIG: /app/lab/monitor.lab.json
+        PYTHONDONTWRITEBYTECODE: "1"
+      exec:
+        - ip addr add 10.0.1.10/24 dev eth1
+        - ip route add 10.0.0.0/8 via 10.0.1.1
+    server:
+      exec:
+        - ip addr add 10.0.4.10/24 dev eth1
+        - ip route add 10.0.0.0/8 via 10.0.4.1
+        - sh -c "nohup python3 -m http.server 80 --bind 10.0.4.10 >/dev/null 2>&1 &"
+    r1:
+      image: frrouting/frr:latest
+      binds:
+        - frr/daemons:/etc/frr/daemons
+        - frr/r1/frr.conf:/etc/frr/frr.conf
+      sysctls:
+        net.ipv4.ip_forward: 1
+        net.ipv4.fib_multipath_hash_policy: 1     # hash on ports too: per-flow ECMP
+    r2:
+      image: frrouting/frr:latest
+      binds:
+        - frr/daemons:/etc/frr/daemons
+        - frr/r2/frr.conf:/etc/frr/frr.conf
+      sysctls:
+        net.ipv4.ip_forward: 1
+    r3:
+      image: frrouting/frr:latest
+      binds:
+        - frr/daemons:/etc/frr/daemons
+        - frr/r3/frr.conf:/etc/frr/frr.conf
+      sysctls:
+        net.ipv4.ip_forward: 1
+    r4:
+      image: frrouting/frr:latest
+      binds:
+        - frr/daemons:/etc/frr/daemons
+        - frr/r4/frr.conf:/etc/frr/frr.conf
+      sysctls:
+        net.ipv4.ip_forward: 1
+        net.ipv4.fib_multipath_hash_policy: 1
+  links:
+    - endpoints: ["client:eth1", "r1:eth1"]      # 10.0.1.0/24
+    - endpoints: ["r1:eth2", "r2:eth1"]          # 10.0.12.0/24
+    - endpoints: ["r1:eth3", "r3:eth1"]          # 10.0.13.0/24
+    - endpoints: ["r2:eth2", "r4:eth1"]          # 10.0.24.0/24
+    - endpoints: ["r3:eth2", "r4:eth2"]          # 10.0.34.0/24
+    - endpoints: ["r4:eth3", "server:eth1"]      # 10.0.4.0/24

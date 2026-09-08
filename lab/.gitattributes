@@ -1,0 +1,4 @@
+lab/*.sh text eol=lf
+lab/frr/** text eol=lf
+lab/check.py text eol=lf
+lab/*.Dockerfile text eol=lf
