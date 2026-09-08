@@ -1305,7 +1305,8 @@ def _is_ip(s: str) -> bool:
 def parse_trace(text: str) -> dict:
     """Hops from tracert/traceroute output, in either binary's format and any locale.
 
-    Returns dict(hops=[(addr, [rtt_ms, ...]), ...], target_ip, reached, max_hops). Nothing
+    Returns dict(hops=[(addr, [rtt_ms, ...], [alternate addrs]), ...], target_ip, reached,
+    max_hops). Nothing
     depends on translated words: a hop line is its number followed by anything, an address is
     an address, a round-trip time is a number followed by "ms", and a hop with no address is
     silent ('*'). "<1 ms" is recorded as 1 ms. Hop lines must be consecutive from 1, which is
@@ -1330,7 +1331,18 @@ def parse_trace(text: str) -> dict:
             continue
         addrs = _IPV4.findall(rest) or _IPV6.findall(rest)
         rtts = [float(x.replace(",", ".")) for x in _RTT.findall(rest)]
-        hops.append((addrs[0] if addrs else "*", rtts))
+        # Every address the hop answered from, not just the first. Linux traceroute sends
+        # each probe as its own flow, and a router that load-balances per flow answers one
+        # probe from one branch and the next from another - the line then carries two
+        # addresses. Keeping only the first stitched hops from DIFFERENT flows into one
+        # "path": the lab drew r3 -> r4's far interface, a link that does not exist, from
+        # 1836 traces. The first address stays the hop's name; the rest ride along as
+        # alternates, and a hop with any is ambiguous to everything downstream.
+        uniq: list[str] = []
+        for a in addrs:
+            if a not in uniq:
+                uniq.append(a)
+        hops.append((uniq[0] if uniq else "*", rtts, uniq[1:]))
     m = re.search(r"max_hops=(\d+)", text)
     max_hops = int(m.group(1)) if m else None
     hm = re.search(r"^host=(\S+)", text, re.M)
@@ -1344,7 +1356,8 @@ def parse_trace(text: str) -> dict:
     if not reached:
         while hops and hops[-1][0] == "*":
             hops.pop()
-    return dict(hops=hops, target_ip=target_ip, reached=reached, max_hops=max_hops)
+    return dict(hops=hops, target_ip=target_ip, reached=reached, max_hops=max_hops,
+                multiflow=any(len(h) > 2 and h[2] for h in hops))
 
 
 def _compatible(a: list[str], b: list[str]) -> bool:
@@ -1531,6 +1544,19 @@ def route_history(target: str, days: float = 7.0,
         for i, a in enumerate(c["addrs"]):
             lines.append(f"    {i + 1:>3}  {a}" + ("   (never answered)" if a == "*" else ""))
         return lines
+
+    # Traces whose probes were answered from more than one router at a hop sampled several
+    # paths at once. Their signature is the first answer at each hop, and consecutive hops
+    # may then belong to different flows - so the "paths" below can be composites no packet
+    # took, and their count runs high. Said before any verdict, because the verdict rests on
+    # those signatures.
+    n_multi = sum(1 for r in recs if any(len(h) > 2 and h[2] for h in r[2]))
+    if n_multi:
+        out.append(f"  NOTE: {n_multi} of {len(recs)} traces had a hop answered by more than "
+                   f"one router (per-flow load balancing splitting the probes). Each such "
+                   f"trace's path is the first answer at every hop, so hops may come from "
+                   f"different flows; the distinct paths counted below may be composites, "
+                   f"and their number is not the number of real routes.")
 
     if len(recs) == 1:
         out.append("ONE TRACE: a path, but nothing to compare it with. Trace again later, or "

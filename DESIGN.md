@@ -132,6 +132,23 @@ CREATE TABLE path (                -- the route, as one traceroute saw it
 );
 ```
 
+```sql
+CREATE TABLE topo_host (           -- hosts found on a network by active discovery
+    net_id     TEXT NOT NULL,
+    ip         TEXT NOT NULL,
+    mac        TEXT,
+    hostname   TEXT,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL,
+    PRIMARY KEY (net_id, ip)
+);
+-- and on `net`: trusted INTEGER NOT NULL DEFAULT 0
+```
+
+`trusted` is the gate on active discovery: a sweep sends packets to every address on the
+subnet, and on a network the operator does not administer that is an acceptable-use breach.
+It is set by a person, per network, never by code, and the agent cannot override it.
+
 A path is stored as a sequence rather than reduced to a number, because the question it
 exists for — did the *route* change, or did the same route get slower? — cannot be asked of
 a number. Its retention differs from a sample's: beyond the raw window a trace that repeats

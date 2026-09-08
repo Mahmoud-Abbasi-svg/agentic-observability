@@ -53,6 +53,7 @@ diagnosis without a retry.
 | `net_tools.py` | the eight diagnostic tools. Importable and runnable on its own — `python net_tools.py` exercises each one |
 | `net_store.py` | SQLite store, retention policy, and the network identity (`net_id`) |
 | `net_memory.py` | `baseline`, `detect_change`, `can_detect`, `coverage`, `availability`, `route_history`, and the `assess` statistics behind them |
+| `net_topology.py` | `topology` — the hosts on this subnet (active, and gated per network) and the routers beyond it, stitched from stored traceroutes (passive) |
 | `net_precision.py` | `instrument_options` — measures the agent's own instruments to find which could resolve a given change |
 | `net_season.py` | tests each signal for a repeatable daily rhythm, and narrows the floor only where one is real |
 | `net_size.py` | sets each target's sampling interval from the resolution you need — `python net_size.py [--apply]` |
@@ -71,6 +72,8 @@ diagnosis without a retry.
 | `test_net_ingest.py` | validates pcap parsing against a capture whose response times are known by construction |
 | `test_net_eval.py` | validates that the eval's deterministic scoring does not fire on correct answers |
 | `test_net_path.py` | validates that a route change is told from load balancing, and from the same route getting slower |
+| `test_net_topology.py` | validates that discovery refuses where it must, sweeps what it may, and draws the map right |
+| `lab/` | a containerlab network with known answers, for grading the tools against ground truth — see `lab/README.md` |
 | `net_monitor.db` | the store (created on first run; override with `NET_MONITOR_DB`) |
 | `monitor.json` | which targets to collect, how often, optional webhook |
 
@@ -428,6 +431,98 @@ per-hop latencies reach back 14 days. Validated in `test_net_path.py` against co
 histories: a clean change, a change and return, random alternation, alternation whose set
 changes, scattered excursions, a change across a gap, and rises that persist, that do not,
 and that sit on the target alone.
+
+### `topology` — what is on this network, and the path off it
+
+Two halves, and only one of them sends packets to addresses nobody named. That is the line
+every other tool here keeps, so the half that crosses it is fenced.
+
+**Upstream, passive.** Every traceroute to every target shares its first hops, so the union
+of the paths `route_history` already stores is a partial map of the network beyond the
+gateway — built from measurements already taken, with no new packets. Edges carry how many
+traces crossed them, which is the only weight this data can honestly give:
+
+```
+upstream topology on network 'hotspot', last 1 d: 96 traces to 2 target(s), 23 router(s) seen, 30 link(s)
+  172.20.10.1        [90 trace(s) start here]  <- gateway
+     -> 172.29.39.105      [90 trace(s)]  (splits 3 ways)
+        -> 172.29.37.37       [60 trace(s)]  (splits 4 ways)
+           -> 188.114.108.4      [33 trace(s)]  (splits 2 ways)
+              -> 188.114.108.10     [32 trace(s)]  (splits 2 ways)
+                 -> 188.114.108.21     [19 trace(s)]
+                    -> 1.1.1.1            [19 trace(s)]  <- target
+           ...
+        -> 172.29.37.33       [29 trace(s)]  (splits 3 ways)
+           -> 188.114.108.4      [12 trace(s)]  (splits 2 ways)  (continues as drawn above)
+  5 router(s) forward to more than one next hop: ... That is either load balancing or a route
+  that changed in the window - route_history on a target tells which.
+```
+
+The fork at 172.29.39.105 is the morning's route change, visible as topology. Two honesty
+rules: a router several branches rejoin at is drawn once and referenced after (the first
+version printed Cloudflare's shared tail four times), and a trace whose gateway hop was
+silent is labelled as starting where its *record* begins, not where the path does. A known
+limit: a router is seen as its interface addresses, so one box with two interfaces looks
+like two routers. That is traceroute's nature, not something this reads through.
+
+**A link is drawn only if one packet was seen to cross it.** The lab found the failure this
+guards against: UDP traceroute gives each hop's probes a different flow, so under per-flow
+load balancing hop 2 was answered from one branch and hop 3 from the other, and the map
+drew `r3 → r4-via-r2` from 1,836 traces — a link that does not exist. Nothing in the output
+could show it: every hop line carried one address. The fix is at the probe. Traces are ICMP
+on every platform now, one flow per trace, and re-run on the same fabric every stored path
+is one real branch and the phantom link is gone. Where a hop line does carry several
+addresses, that hop is ambiguous, links through it are listed as candidates with a `?`
+rather than drawn, and `route_history` says so before any verdict.
+
+The cost of that honesty is stated in the lab's record: its first `ALTERNATING` result had
+been read off those composite paths, a verdict right by accident, and single-flow probes on
+that kernel see one `STABLE` branch instead. Load balancing is invisible to a single flow.
+That is what traceroute is, and the tool now says what it saw rather than what it stitched.
+
+**LAN, active, and gated.** Sweep the /24 this machine is on, read the ARP cache, list what
+answered. Manual only — never in the collector. Scoped to the local subnet — never a range
+you type, never the internet. And it **refuses on any network you have not marked as yours**:
+
+```
+REFUSED: active discovery on network 'hotspot' (929d15adcacc), which is not marked as yours to scan.
+A sweep sends packets to every address on the subnet. On a network you do not administer that can
+breach its acceptable-use policy and trip its intrusion detection - a campus or institutional
+network is a conversation with its IT department, not a flag to set here.
+If this network IS yours (your own hotspot, your home LAN), mark it once:
+    python net_topology.py --trust
+```
+
+The mark is set by a person at the terminal, per network, and the agent's entry point can
+never override it — a refusal is reported, not worked around. On the lab's management
+segment, where the answer is known, the sweep found seven hosts of seven, every one named by
+reverse DNS, this machine identified:
+
+```
+LAN discovery on network '172.31.250.1', subnet 172.31.250.0/24: 7 host(s) answered of 254 probed, in 12.2 s
+  ip              mac                icmp  note
+  172.31.250.1    ea:98:b2:65:a1:2c  yes   gateway, NEW - not seen on this network before
+  172.31.250.2    82:ab:c6:0e:bb:c3  yes   clab-obs-server.obs-mgmt, NEW - not seen on this network before
+  172.31.250.3    -                  yes   this machine, client, NEW - not seen on this network before
+  ...
+  'arp' = did not answer ping but answered address resolution: present, and dropping ICMP. A host
+  answering neither is invisible to this - a sweep is a lower bound on the network, not an inventory.
+```
+
+Two readings the output guards against on its own: a host that drops ping but answered ARP
+is present and says so (`arp`), and a phone hotspot that shows only its gateway is isolating
+its clients, not empty.
+
+**And the sweep found a bug in the identity system.** The lab's collector had run all
+afternoon under a *weak* identity — the management gateway had never been ARP'd, so its MAC
+was unreadable. The sweep pinged the gateway, its MAC landed in the cache, the next identity
+reading was strong, hashed to a new `net_id`, and one network's history split in two at
+19:06. That is the outage's fragmentation in the other direction: strong-to-weak had been
+fixed by the sticky rule; weak-to-strong minted a fresh id just the same. It is also what left
+two empty phantom rows in the laptop's `net` table, unexplained until then — a weak reading
+at boot, then a strong one thirty seconds later. The rule now: a strong reading adopts a
+recent weak twin with the same gateway, subnet and SSID, and a network already known by its
+MAC keeps the id it was first recorded under. Eighteen identity cases cover both directions.
 
 ### `net_report.py` — the two things prose hides
 

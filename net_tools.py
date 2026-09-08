@@ -170,20 +170,39 @@ def traceroute(host: str, max_hops: int = 20) -> str:
     decline to answer probes while still forwarding traffic normally. What matters is whether
     latency jumps at a hop and stays high for every hop after it.
 
+    Probes are ICMP on every platform, so the whole trace is one flow and its hops belong
+    to one path. (UDP traceroute makes each hop a different flow, and over load balancing
+    the hops it lists can come from different routes.)
+
     Args:
         host: Hostname or IP address to trace toward.
         max_hops: Stop after this many hops, 1-30. Lower is much faster.
     """
     host = _check_host(host)
     max_hops = max(1, min(int(max_hops), MAX_HOPS))
+    note = ""
     if IS_WINDOWS:
         cmd = ["tracert", "-d", "-h", str(max_hops), "-w", "1500", host]
+        rc, out = _run(cmd, timeout=max_hops * 4 + 20)
     elif shutil.which("traceroute"):
-        cmd = ["traceroute", "-n", "-m", str(max_hops), "-w", "2", host]
+        # ICMP, not the UDP default. UDP traceroute gives every hop's probes a different
+        # destination port, so under per-flow load balancing hop 2 and hop 3 are answered
+        # by DIFFERENT flows and the "path" is stitched from two routes: in the lab, 1836
+        # traces drew r1 -> r3 -> r4's r2-side interface, a link that does not exist, and
+        # nothing in the output could show it - every hop line carried one address. ICMP
+        # keeps one flow key for the whole trace, so the hops belong to one path. It needs
+        # a raw socket; where that is refused, UDP is used and the caveat is attached.
+        cmd = ["traceroute", "-I", "-n", "-m", str(max_hops), "-w", "2", host]
+        rc, out = _run(cmd, timeout=max_hops * 4 + 20)
+        if rc != 0 and re.search(r"permitted|permission|raw socket|must be root", out, re.I):
+            cmd = ["traceroute", "-n", "-m", str(max_hops), "-w", "2", host]
+            rc, out = _run(cmd, timeout=max_hops * 4 + 20)
+            note = ("\nNOTE: UDP probes (ICMP needs a raw socket this user lacks). Each hop's "
+                    "probes are a separate flow, so over per-flow load balancing consecutive "
+                    "hops may belong to different paths.")
     else:
         raise ToolError("no traceroute binary found")
-    rc, out = _run(cmd, timeout=max_hops * 4 + 20)
-    return f"host={host} max_hops={max_hops} exit_code={rc}\n--- raw ---\n{out[:4000]}"
+    return f"host={host} max_hops={max_hops} exit_code={rc}{note}\n--- raw ---\n{out[:4000]}"
 
 
 def dns_lookup(name: str, record_type: str = "A") -> str:

@@ -36,6 +36,7 @@ from typing import Optional
 import net_memory
 import net_precision
 import net_tools
+import net_topology
 import net_verify
 
 MODEL = os.environ.get("NET_AGENT_MODEL", "claude-opus-5")
@@ -172,6 +173,14 @@ of one. It also shows per-hop latency for the current path against its own histo
 what separates "the route changed" from "the same route got slower" - the two have different \
 owners. It says WHERE a rise sits; whether the rise is real is still detect_change's call.
 
+For "what is on this network" or "what does the path out look like", use topology. Its \
+default, the upstream map, is built from stored traceroutes and sends nothing. Its "lan" \
+scope sweeps the local subnet and is ACTIVE: it refuses on any network the operator has not \
+marked as theirs, and that refusal is final - report it with its reason, never work around it \
+with ping sweeps of your own. A sweep is a lower bound on the network, not an inventory: a \
+host that answers neither ping nor ARP is invisible to it, and a hotspot that shows only its \
+gateway is isolating its clients, not empty.
+
 13. When you cannot resolve something, say what would. can_detect tells you the current setup \
 is not precise enough; instrument_options tells you which of your instruments, if any, could \
 be. It runs real measurements and takes tens of seconds, so use it when a resolution question \
@@ -203,6 +212,7 @@ TOOLS = {**MEASUREMENT_TOOLS,
          "coverage": net_memory.coverage,
          "availability": net_memory.availability,
          "route_history": net_memory.route_history,
+         "topology": net_topology.topology,
          "instrument_options": net_precision.instrument_options}
 
 

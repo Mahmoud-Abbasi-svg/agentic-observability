@@ -98,15 +98,26 @@ fresh_db() {                     # every scenario starts from an empty history
 
 s1() {
   reset_lab
-  echo "== S1  two equal-cost paths, per-flow hashing: the route ALTERNATES, and that is not a change"
+  echo "== S1  two equal-cost paths: every trace is ONE real path, never a composite of both"
   fresh_db; sleep 120
   out=$(check route)
   echo "$out" | head -6 | sed 's/^/    | /'
-  # Per-flow ECMP hashes each traceroute PROBE separately, so one traceroute samples both
-  # physical paths and the tool sees more than two signatures. The verdict - ALTERNATING,
-  # not a change - is what matters and is what is graded; the count is not.
-  expect "S1 verdict is ALTERNATING, not a change" "$out" '^ALTERNATING:' 'CHANGED [0-9]'
-  expect "S1 says it is load balancing, not a route change" "$out" 'not a route change'
+  # Re-registered after the first version passed on false evidence. With UDP probes each
+  # hop is a different flow, so hop 2 came from one branch and hop 3 from the other, and
+  # "ALTERNATING" was read off composite paths that no packet took. Probes are ICMP now:
+  # one flow per trace, one real path. On this kernel every flow from this client hashes to
+  # the same branch, so a single flow's route is STABLE - which is the truth about that flow.
+  # The fabric's load balancing is invisible to a single flow; ALTERNATING remains covered
+  # by constructed histories in test_net_path.py, not here.
+  expect "S1 every trace is a coherent branch (r2's hops never with r3's)" "$out" \
+      '^STABLE over|^ALTERNATING:' 'CHANGED [0-9]'
+  sigs=$(docker exec clab-obs-client python -c "import sqlite3; c=sqlite3.connect('/data/lab.db'); print('\n'.join(r[0] for r in c.execute('SELECT sig FROM path')))")
+  mixed=$(grep -cE '(10\.0\.13\.3.*10\.0\.24\.4)|(10\.0\.12\.2.*10\.0\.34\.4)' <<<"$sigs" || true)
+  expect "S1 no stored path mixes the two branches (composites=$mixed of $(wc -l <<<"$sigs"))" \
+      "composites=$mixed" 'composites=0'
+  expect "S1 no phantom link in the upstream map" \
+      "$(docker exec clab-obs-client python /app/net_topology.py --upstream --days 1)" \
+      'link\(s\)' '10\.0\.13\.3\s+\[.*\n\s+-> 10\.0\.24\.4'
   report
 }
 

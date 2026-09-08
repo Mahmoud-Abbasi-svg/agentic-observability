@@ -20,6 +20,10 @@ The rule this suite pins down: losing the gateway MAC is evidence about the LINK
 which network the machine is on. A degraded reading sticks to the last MAC-identified network
 unless something still readable contradicts it, or that identity is too old to trust.
 
+And the same rule in the other direction, found in the lab two days later: GAINING the MAC
+must not mint a new identity either. A weak reading followed by a strong one of the same
+gateway, subnet and SSID is one network, and it keeps the id it was first recorded under.
+
 Every case runs against a throwaway database with the probing functions replaced, so it
 neither touches the network nor depends on which one the test machine happens to be on.
 """
@@ -123,6 +127,43 @@ def main() -> int:
     recent = observe()
     ok &= check("when several are known, the one seen most recently is assumed",
                 recent["net_id"] == home["net_id"] and recent["assumed"])
+
+    # ---------------------------------------------------------------- the other direction
+    # Found in the lab, 2026-09-08. The collector ran all afternoon under a WEAK id - the
+    # gateway's MAC had never been ARP'd - then one ping to the gateway put the MAC in the
+    # cache, the next reading was strong, hashed to a new id, and one network's history split
+    # in two. Same fragmentation as the outage, reversed. The rule: a strong reading adopts a
+    # recent weak twin with the same readable facts, and a network already known by its MAC
+    # answers to the id it was first recorded under.
+    CAFE = dict(gw="172.16.0.1", mac="02:00:5e:00:00:03", ssid="Cafe", subnet="172.16.0.0/24")
+    weak = observe(gw=CAFE["gw"], ssid=CAFE["ssid"], subnet=CAFE["subnet"])
+    ok &= check("a first reading with no MAC is a weak identity of its own",
+                weak["strength"] == "weak" and not weak["assumed"])
+    strong = observe(**CAFE)
+    ok &= check("the MAC arriving 30 s later does NOT mint a new id: the weak twin is adopted",
+                strong["net_id"] == weak["net_id"] and strong["strength"] == "strong",
+                f"weak={weak['net_id']} strong={strong['net_id']}")
+    row = CONN.execute("SELECT gw_mac FROM net WHERE net_id=?", (weak["net_id"],)).fetchone()
+    ok &= check("and the adopted row learns the MAC", row and row[0] == CAFE["mac"])
+    again = observe(**CAFE)
+    ok &= check("once the row has the MAC, the same reading still answers to that id",
+                again["net_id"] == weak["net_id"] and again["strength"] == "strong")
+    ok &= check("one network, one row",
+                CONN.execute("SELECT COUNT(*) FROM net WHERE gateway=?",
+                             (CAFE["gw"],)).fetchone()[0] == 1)
+    # A weak twin that is too old is not adopted: the machine may have been elsewhere since.
+    OLD = dict(gw="172.16.9.1", mac="02:00:5e:00:00:04", ssid="Old", subnet="172.16.9.0/24")
+    old_weak = observe(gw=OLD["gw"], ssid=OLD["ssid"], subnet=OLD["subnet"])
+    age_last_seen(old_weak["net_id"], net_store.IDENTITY_STICKY_S + 60)
+    old_strong = observe(**OLD)
+    ok &= check("a weak twin older than the sticky window is NOT adopted",
+                old_strong["net_id"] != old_weak["net_id"])
+    # And a weak row whose gateway differs is a different network, however recent.
+    other = observe(gw="172.16.5.1", ssid="Cafe", subnet="172.16.0.0/24")
+    diff = observe(gw="172.16.6.1", mac="02:00:5e:00:00:05", ssid="Cafe",
+                   subnet="172.16.0.0/24")
+    ok &= check("a recent weak row with a DIFFERENT gateway is not adopted",
+                diff["net_id"] != other["net_id"])
 
     # The identity lookup opens the database read-only and must never raise on the collector's
     # hot path - not even when there is no database yet.

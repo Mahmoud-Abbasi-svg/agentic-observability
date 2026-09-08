@@ -49,17 +49,37 @@ extra privilege and every change is reversible.
 
 | # | ground truth set up | what the tool must say |
 |---|---|---|
-| **S1** | two equal-cost paths, per-flow hashing on | `ALTERNATING` — load balancing, **not** a route change |
+| **S1** | two equal-cost paths, per-flow hashing on | every stored path is ONE real branch, never a composite of both; no phantom link in the map |
 | **S2** | one path removed (link down), then the other | `STABLE`, then `CHANGED` once, diverging at the exact hop that moved |
 | **S3** | 40 ms of netem on the r3→r4 link | route `STABLE`; the per-hop rise placed at hop 3, every later hop sharing it |
 | **S4** | the server's link down for ~70 s | a `DOWN` run on the server; the gateway `never observed down`; **not** a network-wide outage |
 
-All four pass. Two findings came out of building it:
+All four pass — but S1 did not always mean what it does now, and the correction is the
+lab's most important result:
 
-- **Per-flow ECMP hashes each traceroute *probe* separately**, so a single traceroute samples
-  both physical paths and the tool sees more signatures than there are paths. The verdict
-  (`ALTERNATING`) is still right; the path *count* is inflated. Real, and worth knowing when
-  reading a busy ECMP fabric.
+**S1's first version passed on false evidence.** It expected `ALTERNATING` and got it. The
+paths it was alternating between were composites: UDP traceroute gives each hop's probes a
+different flow, hop 2 was always answered from r3 and hop 3 from either of r4's interfaces,
+and the tool stitched `r1 → r3 → r4-via-r2`, a link that does not exist, 1,836 times. The
+verdict was right by accident. Probes are ICMP now — one flow per trace — and on this kernel
+every flow from the client hashes to the same branch, so a single flow's route is `STABLE`.
+That is the truth about a flow. The fabric's load balancing is invisible to any single flow,
+which is a property of traceroute, not a defect to fix here; the `ALTERNATING` logic stays
+covered by constructed histories in `test_net_path.py`. S1 now grades what the lab can
+actually establish: that no stored path mixes the branches and the map draws no phantom link.
+
+Two further findings came out of building it:
+
+- **Per-flow ECMP hashes each traceroute *probe* separately, and that manufactures paths.**
+  Linux traceroute sends every probe as its own flow. Hop 2's first answer always came from
+  r3 and hop 3's from the r4 interface behind r2, so the "path" built from first answers was
+  r1 → r3 → r4-via-r2 — a link that does not exist — and r2 was absent from 1836 traces. The
+  `ALTERNATING` verdict was right, but the paths it listed were composites no packet took,
+  and the first upstream map drew the phantom link as real. Every address a hop answers
+  from is now kept; a hop with more than one is ambiguous, `route_history` says so before
+  its verdict, and the map lists links through such hops as candidates rather than drawing
+  them. The clean fix is at the probe: a single-flow traceroute (`traceroute -I`) has every
+  hop answered by the same path.
 - **OSPF cost changes did not reconverge reliably** in this FRR build even after 25 s, so the
   route-change scenarios drive the change by downing a link instead — which converges at once
   and is a cleaner ground truth anyway.

@@ -109,18 +109,26 @@ def main() -> int:
 
     p = pt(WINDOWS)
     ok &= check("tracert: nine hops, addresses in order, silent hops as '*'",
-                [a for a, _ in p["hops"]] == A and p["reached"] and p["target_ip"] == "1.1.1.1")
+                [h[0] for h in p["hops"]] == A and p["reached"] and p["target_ip"] == "1.1.1.1")
     ok &= check("tracert: '<1 ms' is 1 ms and a hop with one answer of three keeps that one",
                 p["hops"][0][1] == [1.0, 2.0, 3.0] and p["hops"][3][1] == [30.0])
     p = pt(LINUX)
     ok &= check("traceroute: comma decimals, an ECMP hop with two addresses, target from the "
                 "header",
-                [a for a, _ in p["hops"]] == ["192.168.1.1", "*", "10.0.0.1", "93.184.216.34"]
+                [h[0] for h in p["hops"]] == ["192.168.1.1", "*", "10.0.0.1", "93.184.216.34"]
                 and p["hops"][0][1] == [0.412, 0.38, 0.355] and p["reached"]
                 and p["target_ip"] == "93.184.216.34")
+    # The lab drew r3 -> r4's far interface, a link that does not exist, from 1836 traces:
+    # each probe is its own flow, hop 2's first answer came from one branch and hop 3's from
+    # the other, and the first address per hop stitched them. The other addresses a hop
+    # answered from are kept, and a trace with any is flagged as sampling several paths.
+    ok &= check("a hop answered from two routers keeps the second as an alternate, and the "
+                "trace is flagged multi-flow",
+                p["hops"][2][2] == ["10.0.0.2"] and p["multiflow"]
+                and not pt(WINDOWS)["multiflow"])
     p = pt(UNREACHED)
     ok &= check("a trace that never reached its target is trimmed to its last answering hop",
-                [a for a, _ in p["hops"]] == ["172.20.10.1", "172.29.39.105"]
+                [h[0] for h in p["hops"]] == ["172.20.10.1", "172.29.39.105"]
                 and not p["reached"])
     ok &= check("extract_metrics records length and arrival, nothing about reachability",
                 net_memory.extract_metrics("traceroute", WINDOWS)

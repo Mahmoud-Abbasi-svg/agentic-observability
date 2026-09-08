@@ -136,7 +136,23 @@ CREATE TABLE IF NOT EXISTS net (
     ssid     TEXT,
     subnet   TEXT,
     first_seen INTEGER,
-    last_seen  INTEGER
+    last_seen  INTEGER,
+    -- Whether this machine's operator has said the network is theirs to scan. Active
+    -- topology discovery sends packets to addresses nobody named, and refuses on any
+    -- network where this is 0. Set deliberately, by a person, per network - never by code.
+    trusted  INTEGER NOT NULL DEFAULT 0
+);
+
+-- Hosts found on a network by active discovery, scoped to that network like everything
+-- else. A host list from the hotspot says nothing about the office LAN.
+CREATE TABLE IF NOT EXISTS topo_host (
+    net_id     TEXT NOT NULL,
+    ip         TEXT NOT NULL,
+    mac        TEXT,
+    hostname   TEXT,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL,
+    PRIMARY KEY (net_id, ip)
 );
 """
 
@@ -201,12 +217,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         state_cols = {r[1] for r in conn.execute("PRAGMA table_info(alert_state)")}
         adds = [(n, t) for n, t in (("anomaly_since", "INTEGER"), ("peak_shift", "REAL"))
                 if n not in state_cols]
-        if not pending and not adds:
+        net_cols = {r[1] for r in conn.execute("PRAGMA table_info(net)")}
+        net_adds = [] if "trusted" in net_cols else [("trusted", "INTEGER NOT NULL DEFAULT 0")]
+        if not pending and not adds and not net_adds:
             return
         for old, new in pending:
             conn.execute(f"ALTER TABLE sample_hourly RENAME COLUMN {old} TO {new}")
         for name, typ in adds:
             conn.execute(f"ALTER TABLE alert_state ADD COLUMN {name} {typ}")
+        for name, typ in net_adds:
+            conn.execute(f"ALTER TABLE net ADD COLUMN {name} {typ}")
         conn.commit()
     except sqlite3.Error:
         try:
@@ -367,8 +387,24 @@ def network_identity(force: bool = False) -> dict:
     subnet = local_subnet()
 
     # Prefer the MAC; fall back to gateway+subnet, which still separates most real moves.
+    adopted: Optional[str] = None
     if mac:
         basis, strength = f"mac:{mac}|{subnet or ''}", "strong"
+        # A network already known keeps the id it was FIRST recorded under, whatever the
+        # reading looked like then. Found in the lab, 2026-09-08: the collector ran all
+        # afternoon under a weak id - the management gateway had never been ARP'd, so its MAC
+        # was unreadable - then one ping to the gateway put the MAC in the cache, the next
+        # reading hashed to a new id, and one network's history split in two at 19:06. The
+        # outage's fragmentation in the other direction: strong-to-weak was fixed by the
+        # sticky rule below; weak-to-strong minted a fresh id just the same. It is also what
+        # left two empty phantom rows in the laptop's net table - a weak reading at boot,
+        # before the gateway had answered ARP, then a strong one thirty seconds later.
+        #
+        # So: a recent weak twin (same gateway, subnet, SSID; no MAC; seen inside the sticky
+        # window) is adopted and enriched with the MAC by remember_net, and a network whose
+        # MAC is already on record answers to its oldest id. The hash only mints new ones.
+        adopted = (_recent_weak_twin(gw, ssid, subnet, IDENTITY_STICKY_S)
+                   or _known_by_mac(mac, subnet))
     else:
         # The link is down or degraded. Losing the gateway MAC is evidence about the LINK,
         # not about which network this machine is attached to - you do not move house because
@@ -401,13 +437,58 @@ def network_identity(force: bool = False) -> dict:
             basis, strength = f"gw:{gw or ''}|{subnet or ''}|{ssid or ''}", "weak"
         else:
             basis, strength = "offline", "none"
-    net_id = hashlib.sha1(basis.encode()).hexdigest()[:12]
+    net_id = adopted or hashlib.sha1(basis.encode()).hexdigest()[:12]
     label = ssid or gw or subnet or "offline"
 
     info = dict(net_id=net_id, label=label, gateway=gw, gw_mac=mac, ssid=ssid,
                 subnet=subnet, strength=strength, assumed=False)
     _CACHE.update(at=now, info=info)
     return info
+
+
+def _ro_row(sql: str, params: tuple) -> Optional[tuple]:
+    """One row from the database, opened read-only and separately from connect().
+
+    For the identity path, which the collector hits every cycle: it must never create a
+    file, run a migration, take a write lock, or raise. Any failure is "no row".
+    """
+    path = os.environ.get("NET_MONITOR_DB", DB_PATH)
+    if not os.path.exists(path):
+        return None
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        try:
+            return c.execute(sql, params).fetchone()
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return None
+
+
+def _recent_weak_twin(gw: Optional[str], ssid: Optional[str], subnet: Optional[str],
+                      within: float) -> Optional[str]:
+    """The id of a MAC-less network seen recently whose readable facts all match this one.
+
+    The same standard the sticky rule applies in the other direction: recent, and nothing
+    observable disagrees. `IS` rather than `=`, so an unreadable SSID on both sides matches
+    instead of comparing NULL to NULL and failing.
+    """
+    if not gw and not subnet:
+        return None
+    row = _ro_row(
+        "SELECT net_id FROM net WHERE gw_mac IS NULL AND last_seen>=? "
+        "AND gateway IS ? AND subnet IS ? AND ssid IS ? ORDER BY last_seen DESC LIMIT 1",
+        (int(time.time() - within), gw, subnet, ssid))
+    return row[0] if row else None
+
+
+def _known_by_mac(mac: str, subnet: Optional[str]) -> Optional[str]:
+    """The oldest id already recorded for this gateway MAC on this subnet. First recorded
+    wins, so the id stays put however later readings vary."""
+    row = _ro_row(
+        "SELECT net_id FROM net WHERE gw_mac=? AND subnet IS ? ORDER BY first_seen ASC LIMIT 1",
+        (mac, subnet))
+    return row[0] if row else None
 
 
 # How long a strong identity stays usable as the answer to "which network is this?" once the
@@ -462,10 +543,48 @@ def remember_net(conn: sqlite3.Connection, info: dict) -> None:
     conn.execute(
         "INSERT INTO net (net_id,label,gateway,gw_mac,ssid,subnet,first_seen,last_seen) "
         "VALUES (?,?,?,?,?,?,?,?) "
+        # A row adopted from a weak reading learns its MAC here; a row that has one keeps it.
         "ON CONFLICT(net_id) DO UPDATE SET last_seen=excluded.last_seen, "
-        "label=excluded.label",
+        "label=excluded.label, gw_mac=COALESCE(gw_mac, excluded.gw_mac)",
         (info["net_id"], info["label"], info["gateway"], info["gw_mac"],
          info["ssid"], info["subnet"], now, now))
+
+
+# --------------------------------------------------------------------- trust and topology
+
+def is_trusted(conn: sqlite3.Connection, net_id: str) -> bool:
+    """Has the operator marked this network as theirs to scan? Absent column or row: no."""
+    if not has_column(conn, "net", "trusted"):
+        return False
+    row = conn.execute("SELECT trusted FROM net WHERE net_id=?", (net_id,)).fetchone()
+    return bool(row and row[0])
+
+
+def set_trusted(conn: sqlite3.Connection, net_id: str, trusted: bool) -> None:
+    conn.execute("UPDATE net SET trusted=? WHERE net_id=?", (1 if trusted else 0, net_id))
+    conn.commit()
+
+
+def add_topo_hosts(conn: sqlite3.Connection, net_id: str, hosts: list[dict],
+                   ts: Optional[int] = None) -> None:
+    """Record hosts seen by discovery. Re-seeing a host bumps last_seen and refreshes what is
+    known about it; a host never seen again keeps its last_seen, which is the record that it
+    was once there."""
+    now = int(ts if ts is not None else time.time())
+    conn.executemany(
+        "INSERT INTO topo_host (net_id,ip,mac,hostname,first_seen,last_seen) "
+        "VALUES (?,?,?,?,?,?) ON CONFLICT(net_id,ip) DO UPDATE SET "
+        "last_seen=excluded.last_seen, mac=COALESCE(excluded.mac, mac), "
+        "hostname=COALESCE(excluded.hostname, hostname)",
+        [(net_id, h["ip"], h.get("mac"), h.get("hostname"), now, now) for h in hosts])
+    conn.commit()
+
+
+def topo_hosts(conn: sqlite3.Connection, net_id: str) -> list[dict]:
+    return [dict(ip=r[0], mac=r[1], hostname=r[2], first_seen=r[3], last_seen=r[4])
+            for r in conn.execute(
+                "SELECT ip,mac,hostname,first_seen,last_seen FROM topo_host WHERE net_id=? "
+                "ORDER BY ip", (net_id,))]
 
 
 # --------------------------------------------------------------------- writes and reads
@@ -499,21 +618,28 @@ def add_heartbeat(conn: sqlite3.Connection, net_id: str, n_ok: int, n_failed: in
 
 def add_path(conn: sqlite3.Connection, target: str, hops: list, net_id: str,
              reached: bool, ts: Optional[float] = None) -> None:
-    """Store one traceroute. `hops` is [(addr, [rtt_ms, ...]), ...] with '*' for silence."""
+    """Store one traceroute. `hops` is [(addr, [rtt_ms, ...], [alternates]), ...] with '*'
+    for silence; the alternates element is optional and may be omitted."""
     ts = round(float(ts if ts is not None else time.time()), 6)
-    sig = " ".join(a for a, _r in hops)
+    sig = " ".join(h[0] for h in hops)
     conn.execute("INSERT OR REPLACE INTO path (ts,target,net_id,sig,hops,reached) "
                  "VALUES (?,?,?,?,?,?)",
-                 (ts, target, net_id, sig, json.dumps([[a, r] for a, r in hops]),
+                 (ts, target, net_id, sig,
+                  json.dumps([[h[0], h[1]] + ([h[2]] if len(h) > 2 and h[2] else [])
+                              for h in hops]),
                   1 if reached else 0))
 
 
 def paths(conn: sqlite3.Connection, target: str, net_id: str,
           days: float = 7.0) -> list[tuple[float, str, list, int]]:
-    """(ts, sig, hops, reached) for one target ON THIS NETWORK ONLY, oldest first."""
+    """(ts, sig, hops, reached) for one target ON THIS NETWORK ONLY, oldest first.
+
+    Each hop comes back as (addr, rtts, alternates); rows written before alternates were
+    recorded read back with an empty list, so every reader sees one shape."""
     cutoff = time.time() - days * 86400
-    return [(ts, sig, [(a, r) for a, r in json.loads(h)], reached)
-            for ts, sig, h, reached in conn.execute(
+    return [(ts, sig, [(h[0], h[1], h[2] if len(h) > 2 else []) for h in json.loads(hs)],
+             reached)
+            for ts, sig, hs, reached in conn.execute(
                 "SELECT ts, sig, hops, reached FROM path WHERE target=? AND net_id=? "
                 "AND ts>=? ORDER BY ts", (target, net_id, cutoff))]
 
