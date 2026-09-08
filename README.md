@@ -382,12 +382,19 @@ So there are three verdicts, and the middle one is the point:
 | verdict | what the traces show | what it means |
 |---|---|---|
 | `STABLE` | one path throughout; a hop that sometimes fails to answer is a wildcard, not a different route | nothing to explain |
-| `ALTERNATING` | the path switches more often than once per 20 traces, all window long | ECMP: a fact about the topology, not a change — and it checks whether the *set* of rotating paths itself changed, which is a change underneath the alternation |
+| `ALTERNATING` | at least four switches, more often than once per 20 traces, all window long | ECMP: a fact about the topology, not a change — and it checks whether the *set* of rotating paths itself changed, which is a change underneath the alternation |
 | `CHANGED` | one path established for ≥3 consecutive traces, then another, and the first does not come back | placed between the last trace on the old path and the first on the new; across a gap it says the change is somewhere in the unobserved stretch |
 
 Lone traces on another path are counted as *excursions*, never as changes. The first version
 reported "A -> A" three times for three lone traces elsewhere — an established path resumed
 after an excursion is one stretch, not two with a change between them.
+
+**And the first real route change it saw, it called load balancing.** On 2026-09-08 hop 4
+moved across a 12-hour shutdown: thirteen traces on the old path, seven on the new. One switch
+in twenty traces is a rate of 0.053, just over the rotation threshold, and the verdict was
+*"ALTERNATING … it is not a route change"* — the tool built to stop this error, making it on
+day one. A single switch is never a rate; rotation now needs at least four. Same shape as the
+other eleven this week: the measurement was right, the meaning was invented.
 
 Then the second half of the question. For the path the latest trace took, per-hop latency now
 against earlier:

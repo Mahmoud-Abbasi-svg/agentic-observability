@@ -218,6 +218,28 @@ def main() -> int:
     ok &= check("a change across a gap says the change is somewhere in the unobserved stretch",
                 "CHANGED 1 time(s)" in t and "no traces for 4.2 h in between" in t)
 
+    # --- the first real route change this tool saw, 2026-09-08: thirteen traces on one path,
+    # a 12 h shutdown, seven on another (hop 4 moved). One switch in twenty traces is a rate
+    # of 0.053, just over ROTATION_RATE, and the verdict was "ALTERNATING ... not a route
+    # change". A single switch is never a rotation.
+    for i in range(85, 72, -1):
+        put("real", i, A)
+    for i in range(7, 0, -1):
+        put("real", i, B)
+    t = net_memory.route_history("real", 1)
+    ok &= check("one switch in twenty traces is a CHANGE across the gap, not ALTERNATING",
+                "CHANGED 1 time(s)" in t and "ALTERNATING" not in t
+                and "no traces for 11.0 h in between" in t,
+                [l for l in t.splitlines() if "A -> B" in l][0][:60])
+    # And the same twenty traces with no gap: still one change.
+    for i in range(20, 7, -1):
+        put("real2", i, A)
+    for i in range(7, 0, -1):
+        put("real2", i, B)
+    t = net_memory.route_history("real2", 1)
+    ok &= check("one switch in twenty consecutive traces is a CHANGE",
+                "CHANGED 1 time(s)" in t and "ALTERNATING" not in t)
+
     # --- the latest traces are on a new path but too few to be established
     for i in range(50, 2, -1):
         put("fresh", i, A)

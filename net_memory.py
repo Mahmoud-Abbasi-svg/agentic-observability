@@ -1282,6 +1282,12 @@ def availability(target: str = "", hours: float = 24.0) -> str:
 
 MIN_RUN = 3            # consecutive traces before a path counts as established
 ROTATION_RATE = 0.05   # transitions per trace above which alternation, not change, is read
+# ...but only once there are enough transitions for a rate to mean anything. The first real
+# route change this tool saw - hop 4 moved across a shutdown, thirteen traces on the old
+# path and seven on the new - was ONE switch in twenty traces: 0.053, just over the rate,
+# and it was reported as "ALTERNATING ... not a route change". A single switch is a change
+# candidate, never a rotation; four is the fewest that can be called alternation.
+MIN_SWITCHES = 4
 PATH_RECENT_HOURS = 2.0
 
 _IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])")
@@ -1474,10 +1480,11 @@ def route_history(target: str, days: float = 7.0) -> str:
     Three verdicts, and the middle one is the point:
       STABLE       every trace took the same path (a hop that sometimes does not answer is
                    the same hop, not a different route).
-      ALTERNATING  the path switches every few traces, throughout. That is per-flow load
-                   balancing: the network hashes each probe onto one of several equal-cost
-                   links. It is a fact about the topology, not a change, and two traces that
-                   differ are not evidence of one.
+      ALTERNATING  the path switches every few traces, throughout - at least four switches,
+                   more than one per twenty traces. That is per-flow load balancing: the
+                   network hashes each probe onto one of several equal-cost links. It is a
+                   fact about the topology, not a change, and two traces that differ are not
+                   evidence of one. A single switch is never called this.
       CHANGED      one path was established, then another was, and the first did not come
                    back. The change is placed between the last trace on the old path and
                    the first on the new one.
@@ -1549,7 +1556,7 @@ def route_history(target: str, days: float = 7.0) -> str:
         out += _hop_table(recs, labels, cur, classes[cur]["addrs"], now, days)
         return "\n".join(out)
 
-    if rate > ROTATION_RATE:
+    if rate > ROTATION_RATE and transitions >= MIN_SWITCHES:
         out.append(f"ALTERNATING: {len(classes)} paths in rotation, a switch every "
                    f"{1 / rate:.1f} traces on average ({transitions} switches in {len(recs)} "
                    f"traces). This is what per-flow load balancing looks like from a "
