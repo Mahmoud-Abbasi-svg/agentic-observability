@@ -1,0 +1,35 @@
+{
+"server": {
+  "listenerAddress": "0.0.0.0",
+  "listenerPort": 5020,
+  "protocol": "TCP",
+  "tlsParams": {
+    "description": "path to certificate and private key to enable tls",
+    "privateKey": null,
+    "certificate": null
+    },
+  "logging": {
+    "format": "%(asctime)-15s %(threadName)-15s  %(levelname)-8s %(module)-15s:%(lineno)-8s %(message)s",
+    "logLevel": "WARNING"
+    }
+  },
+"persistence": {
+  "enabled": false,
+  "file": "/data/modbus_registers.json",
+  "saveInterval": 30
+  },
+"metrics": {
+  "enabled": false,
+  "address": "0.0.0.0",
+  "port": 9090,
+  "path": "/metrics"
+},
+"registers": {
+  "description": "the image's default config verbatim, with two holding registers set; the server requires every key",
+  "initializeUndefinedRegisters": true,
+  "discreteInput": {},
+  "coils": {},
+  "holdingRegister": {"0": 1234, "1": 5678},
+  "inputRegister": {}
+  }
+}

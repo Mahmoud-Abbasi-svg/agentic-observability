@@ -80,7 +80,7 @@ diagnosis without a retry.
 | `test_net_downrun.py` | validates the run-length rule for `reachable`: flaps stay silent, outages fire on the third pass, a gap is not an outage, and the case the floor missed live now alerts |
 | `study_atlas_runs.py` | the run-length thresholds tested on 200 RIPE Atlas probes, pre-registered — they failed; see `ATLAS_RUNS_2026-09-09.md` |
 | `study_atlas_adaptive.py` | the pre-registered consequence (N from history) tried out of sample on the same data — passes fatigue by silencing hour-long outages |
-| `lab/` | a containerlab network with known answers, for grading the tools against ground truth — see `lab/README.md` |
+| `lab/` | a containerlab network with known answers, for grading the tools against ground truth — routers, an HTTP server, and two Modbus devices polled by a SCADA host in miniature so the passive path is graded from a real capture; see `lab/README.md` |
 | `net_monitor.db` | the store (created on first run; override with `NET_MONITOR_DB`) |
 | `monitor.json` | which targets to collect, how often, optional webhook |
 
@@ -803,6 +803,42 @@ to all of them. Only the epoch offset moves — intervals, gaps and ordering are
 exactly — and the capture date goes into the network label so a replay can never be mistaken
 for live measurement. `--no-shift` keeps the real times, and then the tools find nothing,
 which is why it is not the default.
+
+**What "down" means when you cannot probe.** The collector measures reachability by sending a
+probe and seeing whether it is answered. A capture cannot send anything, and its equivalent of a
+failed probe is a request the device never answered. The first reader paired replies with
+requests and dropped the rest, so the one event that matters most on a plant floor, the device
+going silent, was the one event it could not see. Every Modbus request is now a `reachable`
+sample at the request's own time, 1 if a reply came and 0 if not, alongside `response_ms` for
+the answered ones. The same run logic then cuts it into up, down and gap, so the passive path
+gets `availability`, the report, the live page and alert rule 6 without any of them changing.
+
+"Did not answer" is judged by two rules and no constant. A pending request is unanswered when a
+*later* request on the same stream was answered while it still waited, since Modbus answers in
+order over one connection; or, when a newer request is sent and this one is older than twice
+the stream's own typical inter-request gap, a running median. The second rule exists because
+the first cannot fire when a device has gone silent for good, and that is exactly the case that
+matters. Requests still pending when the capture ends are reported as UNRESOLVED and never
+stored as failures: "the capture stopped" and "the device did not answer" are different
+statements and the data only supports the first. Everything on port 502 that is not Modbus is
+counted and reported, never silently dropped.
+
+On the third day of the [4SICS](https://www.netresec.com/?page=PCAP4SICS) capture, real
+industrial hardware at a conference lab (credit CS3Sthlm), it read 49,794 requests on 33
+streams: three devices at unit 1 with about 16,500 polls each, nearly all answered and nearly
+all as Modbus exceptions, which is what a scanner asking the wrong function looks like; one of
+them dropped exactly two polls out of 16,594; the scanner's probes to unit 0 went unanswered on
+every device and are reported as such; 76 unanswered in all, 19 left pending at the end, and
+312 port-502 payloads that were not Modbus plus 2,356 too short to carry a header, all counted.
+The first two days hold almost no Modbus. One device yields a noise floor, and the floor is
+honest about what it measured: 111%, a smallest resolvable shift of 150%, because a scanner
+hammering a device is not a polled process. That is the limit the pre-registration stated for
+4SICS before it was parsed. It exercises the parser on real hardware; the cadence and floors of
+a real plant are what SWaT is for.
+
+Reading that replay found a wording error in the tools. Every silent stretch in a capture was
+labelled *"collector was not running"*, a cause the data cannot support, since a capture never
+had a collector. Silence on the wire is the poller's, and is now worded that way.
 
 **Captures need shorter windows than live monitoring.** A 30-minute capture cannot fill the
 2-hour default comparison window; it yields one placebo window and the honest answer is

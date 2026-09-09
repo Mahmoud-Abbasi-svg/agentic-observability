@@ -1064,6 +1064,12 @@ def _gap_reason(r: dict, now: float) -> str:
             why += f"; the other {_fmt_dur(rest)} is unaccounted for"
         return why
     if r["beats"] == 0:
+        # A network with no heartbeat cadence at all never had a collector: it is a capture.
+        # "Collector was not running" is then an invented cause - on the 4SICS replay it read
+        # as a monitor outage when the truth is that nobody polled the device in that stretch.
+        if r.get("expected", 0) <= 0:
+            return ("nothing on the wire - no requests to this host in this stretch (a capture "
+                    "has no collector; silence here is the poller's, not the monitor's)")
         return "collector was not running"
     return f"collector was not running - only {r['beats']} of ~{r['expected']:.0f} expected cycles"
 

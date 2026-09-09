@@ -42,6 +42,25 @@ topology:
         - ip addr add 10.0.4.10/24 dev eth1
         - ip route add 10.0.0.0/8 via 10.0.4.1
         - sh -c "nohup python3 -m http.server 80 --bind 10.0.4.10 >/dev/null 2>&1 &"
+    # Two Modbus/TCP devices behind r4, each on its own link so one can be cut without the
+    # other. The client polls them once a second (lab/poller.py) and records the traffic;
+    # net_ingest reads it back. That is the industrial deployment in miniature: the monitor
+    # never sends a Modbus packet of its own. Port 5020, not 502: the image runs unprivileged
+    # and cannot bind below 1024. The wire format is identical; net_ingest takes --port.
+    plc1:
+      image: oitc/modbus-server:latest
+      binds:
+        - modbus/plc.json:/app/modbus_server.json:ro
+      exec:
+        - ip addr add 10.0.5.10/24 dev eth1
+        - ip route add 10.0.0.0/8 via 10.0.5.1
+    plc2:
+      image: oitc/modbus-server:latest
+      binds:
+        - modbus/plc.json:/app/modbus_server.json:ro
+      exec:
+        - ip addr add 10.0.6.10/24 dev eth1
+        - ip route add 10.0.0.0/8 via 10.0.6.1
     r1:
       image: frrouting/frr:latest
       binds:
@@ -79,3 +98,5 @@ topology:
     - endpoints: ["r2:eth2", "r4:eth1"]          # 10.0.24.0/24
     - endpoints: ["r3:eth2", "r4:eth2"]          # 10.0.34.0/24
     - endpoints: ["r4:eth3", "server:eth1"]      # 10.0.4.0/24
+    - endpoints: ["r4:eth4", "plc1:eth1"]        # 10.0.5.0/24
+    - endpoints: ["r4:eth5", "plc2:eth1"]        # 10.0.6.0/24
