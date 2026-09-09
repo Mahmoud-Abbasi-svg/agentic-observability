@@ -78,6 +78,8 @@ diagnosis without a retry.
 | `test_net_report.py` | validates that the report never colours unobserved time as quiet, and flags a held alert's age |
 | `test_net_web.py` | validates the live view over a real socket: loopback only, foreign Host refused, no probe exposed, read-only, ages are of the data |
 | `test_net_downrun.py` | validates the run-length rule for `reachable`: flaps stay silent, outages fire on the third pass, a gap is not an outage, and the case the floor missed live now alerts |
+| `study_atlas_runs.py` | the run-length thresholds tested on 200 RIPE Atlas probes, pre-registered — they failed; see `ATLAS_RUNS_2026-09-09.md` |
+| `study_atlas_adaptive.py` | the pre-registered consequence (N from history) tried out of sample on the same data — passes fatigue by silencing hour-long outages |
 | `lab/` | a containerlab network with known answers, for grading the tools against ground truth — see `lab/README.md` |
 | `net_monitor.db` | the store (created on first run; override with `NET_MONITOR_DB`) |
 | `monitor.json` | which targets to collect, how often, optional webhook |
@@ -672,7 +674,21 @@ with two earlier outages in its history, on which the placebo path reports a zer
 against a 100% floor and the run rule fires on the third pass. Six mutations of the rule —
 never fire, always fire, count a gap as ongoing, drop the confirmations, route through the
 old floor, mute the alert text — are each caught. `ok_2xx` and `success_rate` have the same
-weakness and are the next step, so this change is one metric wide.
+weakness, so this change is one metric wide.
+
+**Then the thresholds were tested on networks that are not this one, and failed.** The same
+afternoon, 28 days of RIPE Atlas ping from 200 probes in 126 countries to four root servers,
+cut into runs the same way, with the bar fixed in advance: the gap generalises if fewer than
+one probe in twenty has a run in the ambiguous band. Forty percent do. There is no gap at all
+elsewhere — run lengths decay smoothly from one sample to two to three — and the two networks
+here showed one because they held 43 runs. Under the shipped rule the page rate is 0.17 per
+probe-day, above the 0.1 bar. Full record in `ATLAS_RUNS_2026-09-09.md`. The constants stand
+as shipped and the gate is not moved: the rule separates *this machine's* flaps from its
+outages, which is what it was built on, and it is not yet a rule for anyone else's network.
+The pre-registered consequence, N from the target's own history, was tried out of sample and
+passes the fatigue bar by silencing nineteen outages of an hour or more on series whose
+history already held a long one — the floor's failure mode, back in miniature. What to build
+instead is a design decision, recorded there, not a constant.
 
 ### Detectable is not the same as worth telling you about
 
