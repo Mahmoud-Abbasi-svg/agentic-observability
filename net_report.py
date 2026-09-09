@@ -114,7 +114,13 @@ def ago(ts: float, now: float) -> str:
 
 def _segments(conn, target: str, net_id: str, since: float, now: float,
               beats: list, cadence: float, other: list) -> tuple[list, dict]:
-    """Runs for one target, as (kind, left%, width%, title) plus a small summary."""
+    """Runs for one target, as dicts {kind, left, width, title}, plus a small summary.
+
+    The three-state colour rule lives here and nowhere else. `timeline()` below hands these
+    same dicts to the live view, so the two surfaces cannot disagree about which time was
+    observed - a live page that rebuilt this logic for itself would be free to drift, and the
+    one way this kind of tool misleads is by drawing a gap as a quiet period.
+    """
     rows = list(conn.execute(
         "SELECT ts, value FROM sample WHERE target=? AND metric='reachable' AND net_id=? "
         "AND ts>=? ORDER BY ts", (target, net_id, since)))
@@ -143,53 +149,82 @@ def _segments(conn, target: str, net_id: str, since: float, now: float,
             why = f"{r['n']} successful probe(s)"
         label = {"up": "up", "down": "DOWN", "gap": "not measured",
                  "else": "not measured here"}[css]
-        segs.append((css, 100.0 * (a - since) / span, 100.0 * (b - a) / span,
-                     f"{time.strftime('%d %b %H:%M', time.localtime(a))} - "
-                     f"{time.strftime('%d %b %H:%M', time.localtime(b))}  "
-                     f"({dur(b - a)})  {label}: {why}"))
+        segs.append({
+            "kind": css,
+            "left": 100.0 * (a - since) / span,
+            "width": 100.0 * (b - a) / span,
+            "title": (f"{time.strftime('%d %b %H:%M', time.localtime(a))} - "
+                      f"{time.strftime('%d %b %H:%M', time.localtime(b))}  "
+                      f"({dur(b - a)})  {label}: {why}")})
     longest = max((r for r in runs if r["kind"] == "down"),
                   key=lambda r: r["end"] - r["start"], default=None)
     return segs, {"tot": tot, "longest": longest, "probes": len(rows)}
 
 
-def _network_section(conn, net: dict, since: float, now: float) -> str:
-    nid = net["net_id"]
+def _bar_state(tot: dict, since: float, now: float) -> tuple[str, str]:
+    """The one-phrase verdict beside a bar, as (css class, words).
+
+    Three outcomes, never two: a failure that was seen, a window too unobserved to make any
+    claim about, and no failure seen. The middle one is the whole point - "no failure seen"
+    over a window that was 90% unmeasured is a statement about the collector, not the network.
+    """
+    down, gap = tot.get("down", 0.0), tot.get("gap", 0.0)
+    if down > 0:
+        return "p-bad", f"down {dur(down)}"
+    if gap > 0.5 * (now - since):
+        return "p-dim", "mostly unobserved"
+    return "p-ok", "no failure seen"
+
+
+def timeline(conn, net_id: str, since: float, now: float) -> dict:
+    """Every target's reachability runs on one network, as data rather than markup.
+
+    Shared by the static report and the live view. Returns the same segment dicts `_segments`
+    produces, so neither surface owns the definition of "observed".
+    """
     beats = [r[0] for r in conn.execute(
-        "SELECT ts FROM heartbeat WHERE net_id=? AND ts>=? ORDER BY ts", (nid, since))]
+        "SELECT ts FROM heartbeat WHERE net_id=? AND ts>=? ORDER BY ts", (net_id, since))]
     bd = [b - a for a, b in zip(beats, beats[1:]) if b > a]
     cadence = sorted(bd)[len(bd) // 2] if bd else 0.0
     other = list(conn.execute(
         "SELECT h.ts, COALESCE(n.label, h.net_id) FROM heartbeat h "
         "LEFT JOIN net n ON n.net_id=h.net_id WHERE h.ts>=? AND h.net_id!=? ORDER BY h.ts",
-        (since, nid)))
-    targets = [r[0] for r in conn.execute(
+        (since, net_id)))
+    names = [r[0] for r in conn.execute(
         "SELECT target FROM sample WHERE net_id=? AND metric='reachable' AND ts>=? "
-        "GROUP BY target HAVING COUNT(*)>=3 ORDER BY target", (nid, since))]
-    if not targets and not beats:
+        "GROUP BY target HAVING COUNT(*)>=3 ORDER BY target", (net_id, since))]
+    targets = []
+    for t in names:
+        segs, sm = _segments(conn, t, net_id, since, now, beats, cadence, other)
+        if not segs:
+            continue
+        cls, words = _bar_state(sm["tot"], since, now)
+        targets.append({"target": t, "segments": segs, "probes": sm["probes"],
+                        "state_class": cls, "state": words})
+    return {"net_id": net_id, "beats": len(beats), "cadence": cadence, "targets": targets}
+
+
+def _network_section(conn, net: dict, since: float, now: float) -> str:
+    nid = net["net_id"]
+    tl = timeline(conn, nid, since, now)
+    if not tl["targets"] and not tl["beats"]:
         return ""
 
     out = [f'<h2>{e(net["label"])} <span class="pill p-dim">{e(nid)}</span></h2>',
            '<div class="card">']
-    if not targets:
+    if not tl["targets"]:
         out.append('<p class="note">Heartbeats but no reachability samples in this '
                    'window.</p></div>')
         return "\n".join(out)
 
-    for t in targets:
-        segs, sm = _segments(conn, t, nid, since, now, beats, cadence, other)
-        if not segs:
-            continue
+    for row in tl["targets"]:
         bars = "".join(
-            f'<div class="seg {c}" style="left:{l:.4f}%;width:{w:.4f}%" title="{e(ti)}"></div>'
-            for c, l, w, ti in segs)
-        down, gap = sm["tot"].get("down", 0), sm["tot"].get("gap", 0)
-        if down > 0:
-            meta = f'<span class="pill p-bad">down {dur(down)}</span>'
-        elif gap > 0.5 * (now - since):
-            meta = '<span class="pill p-dim">mostly unobserved</span>'
-        else:
-            meta = '<span class="pill p-ok">no failure seen</span>'
-        out.append(f'<div class="row"><div class="name" title="{e(t)}">{e(t)}</div>'
+            f'<div class="seg {s["kind"]}" style="left:{s["left"]:.4f}%;'
+            f'width:{s["width"]:.4f}%" title="{e(s["title"])}"></div>'
+            for s in row["segments"])
+        meta = f'<span class="pill {row["state_class"]}">{e(row["state"])}</span>'
+        out.append(f'<div class="row"><div class="name" title="{e(row["target"])}">'
+                   f'{e(row["target"])}</div>'
                    f'<div class="bar">{bars}</div><div class="meta">{meta}</div></div>')
     lo = time.strftime("%d %b %H:%M", time.localtime(since))
     hi = time.strftime("%d %b %H:%M", time.localtime(now))

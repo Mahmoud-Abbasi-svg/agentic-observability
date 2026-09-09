@@ -186,7 +186,21 @@ def install_crash_log(name: str) -> str:
     return log
 
 
-def connect(path: str = DB_PATH) -> sqlite3.Connection:
+def connect(path: Optional[str] = None) -> sqlite3.Connection:
+    """Open the store, creating it if needed. The path is read from NET_MONITOR_DB at CALL
+    time, not bound as a default at import time.
+
+    It was `path: str = DB_PATH`, which freezes whatever the environment held when this module
+    was first imported. Every test sets NET_MONITOR_DB to a throwaway file before importing
+    anything - and a harness that imported one module first, then the test, had its env set
+    too late: the test's connect() defaulted to the real store, and 393 backdated fake samples
+    with a 30-minute outage and two ALERTING rows landed in the live database on 2026-09-09.
+    A net row named office-wifi from the day before was the same failure in an earlier session.
+    The comment in _identity_from_db had already described this hazard and worked around it
+    for one caller; this removes it for all of them.
+    """
+    if path is None:
+        path = os.environ.get("NET_MONITOR_DB") or DB_PATH
     conn = sqlite3.connect(path, timeout=15)
     conn.execute("PRAGMA journal_mode=WAL")       # survives a hard stop mid-write
     conn.execute("PRAGMA synchronous=NORMAL")

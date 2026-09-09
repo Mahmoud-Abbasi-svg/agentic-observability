@@ -62,6 +62,8 @@ diagnosis without a retry.
 | `net_collect.py` | the collector — measures on a schedule, no model call, ever |
 | `net_ingest.py` | passive alternative: reads Modbus/TCP response times out of a pcap, for networks you must not probe |
 | `net_alert.py` | the evaluator, alert state machine and notifier |
+| `net_report.py` | one self-contained HTML snapshot of the store: reachability timelines and held alert states with their age |
+| `net_web.py` | the same timelines live on loopback, with the history-reading tools one click from each target — never measures, never writes |
 | `net_eval.py` | scores the agent on scenarios with known answers — `python net_eval.py [-r 3]` |
 | `test_detect_change.py` | validates the change-detection statistics against injected shifts |
 | `test_net_alert.py` | validates the alerting against constructed histories |
@@ -73,6 +75,8 @@ diagnosis without a retry.
 | `test_net_eval.py` | validates that the eval's deterministic scoring does not fire on correct answers |
 | `test_net_path.py` | validates that a route change is told from load balancing, and from the same route getting slower |
 | `test_net_topology.py` | validates that discovery refuses where it must, sweeps what it may, and draws the map right |
+| `test_net_report.py` | validates that the report never colours unobserved time as quiet, and flags a held alert's age |
+| `test_net_web.py` | validates the live view over a real socket: loopback only, foreign Host refused, no probe exposed, read-only, ages are of the data |
 | `lab/` | a containerlab network with known answers, for grading the tools against ground truth — see `lab/README.md` |
 | `net_monitor.db` | the store (created on first run; override with `NET_MONITOR_DB`) |
 | `monitor.json` | which targets to collect, how often, optional webhook |
@@ -551,6 +555,54 @@ picture to lie is to draw a gap the same colour as a quiet period. A fourth shad
 The output is local by design: it quotes the SSID, the gateway and this machine's addresses,
 which is what makes it useful and why `net_report.html` is in `.gitignore`. Publishing it
 would leak exactly what keeping the database out of the repo protects.
+
+### `net_web.py` — the same picture, live, with the tools one click away
+
+```
+python net_web.py --open          # http://127.0.0.1:8420
+```
+
+The report answers *what happened* and stops. Two things it cannot do: stay current, and show
+anything beyond reachability. Route changes, per-hop latency, change detection against a
+measured noise floor, coverage, the upstream map — the parts this project is actually good at —
+had no visual surface at all. The live view serves the report's **own run logic**
+(`net_report.timeline`, shared rather than reimplemented, so the two surfaces cannot disagree
+about which time was observed) and puts the history-reading tools beside the target they
+describe: click a bar and read `availability`, `detect_change` across every probe type,
+`baseline` and `route_history` for it, as the tools themselves word them.
+
+A live page can mislead in ways a snapshot cannot, and each got a pre-registered check:
+
+- **It implies "now" by existing.** Every age shown is the age of the *data*, never of the
+  request. The collector is called NOT COLLECTING the moment its heartbeat is older than five
+  minutes, and a page that loses the server says so across the top and dims everything below
+  rather than sitting there looking current.
+- **It could measure.** A dashboard that probes on a timer writes into the same history the
+  baselines are built from — a tab left open overnight quietly rewriting the record it shows.
+  No endpoint reaches a tool that sends a packet; the test checks the exposed surface against
+  every probe in `net_tools`. The upstream map is pinned in code to the scope that reads stored
+  traces, never the LAN sweep.
+- **Refresh looks like change.** Nothing animates on a poll. A stalled collector shows a rising
+  age, not a busy page.
+- **The colour rule** is inherited by sharing the report's code, not by copying its intent.
+
+It is **loopback only, and that is refused rather than warned**: the store holds the SSID and
+the gateway MAC, which together place this machine on a street. A request arriving under a
+foreign `Host` name is rejected too, or any site the operator visits could point a hostname at
+`127.0.0.1` and read the dashboard from inside its own origin. The gateway MAC never crosses
+the socket. The database is opened read-only. There is no write path: the page cannot trust a
+network, edit config or delete a row. No framework, no CDN, no external request of any kind.
+
+**What building it found.** The synthetic test passed 43 of 43 and mutation-testing then showed
+two of its checks were hollow — one passed a collector that could never be called dead, because
+the test derived its cutoff from the very threshold it was checking. Then the first live run
+listed a network called `office-wifi` and a target called `gw` in the real store: test
+fixtures. `net_store.connect()` bound the database path as a default argument at *import*
+time, so any process that imported a module before setting `NET_MONITOR_DB` wrote to the
+production store. A harness of mine had done exactly that and put 393 backdated fake samples
+with a 30-minute outage, and two ALERTING rows, into the live database; `office-wifi` was the
+same failure from a day earlier. The path is now read at call time, the rows are gone, and a
+backup was taken first.
 
 ## The monitor
 
