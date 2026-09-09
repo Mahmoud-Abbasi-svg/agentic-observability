@@ -33,6 +33,13 @@ Four rules do the work, and each exists because of a specific way monitors fail:
    worth_alerting. A shift that is real and deliberately not paged is shown with the reason,
    because unexplained silence is indistinguishable from a monitor that missed something.
 
+6. A BINARY SIGNAL IS JUDGED BY RUN LENGTH, NOT BY A NOISE FLOOR. `reachable` is 0 or 1 per
+   probe; it has no shift size, and a placebo floor built from a history that contains earlier
+   outages grows until "100% down" is within noise. On 2026-09-08 every host was down for 96
+   consecutive probes and reachable alerted on none of them. So it exceeds when its current
+   run of failures is long enough in probes AND in minutes, and feeds the same state machine
+   as everything else. The thresholds come from the store's own outages, see down_run.
+
 There is no model call anywhere in this file. Detection must be a pure function of the data:
 an alert that fires or not depending on sampling temperature is not an alert. The agent's job
 starts after this one ends, explaining an alert this code decided to fire.
@@ -340,6 +347,111 @@ def step(state: str, streak: int, exceeds: bool) -> tuple[str, int, Optional[str
     return "UNKNOWN", 0, None
 
 
+# The run-length rule for `reachable` (rule 6). Both conditions must hold, because cadence
+# varies by a factor of sixty across targets: on the lab's 5 s pings three probes is fifteen
+# seconds, and on a five-minute http check five minutes is a single probe.
+#
+# Calibrated on the live store, 14 days, every DOWN run on every network (2026-09-09):
+#   flaps    n in {1, 2, 3}, every one under a minute on a 60 s cadence (one n=2 at 3.2 min
+#            on a 297 s cadence)
+#   outages  n >= 15, every one >= 17.4 min
+# Nothing between 3.2 and 17.4 minutes. Five minutes sits in that gap with a wide margin on
+# both sides. The lab's S4 link-down lasts ~70 s and does NOT page under this rule; that is
+# the right answer for a pager and is recorded rather than tuned away.
+DOWN_MIN_PROBES = 3
+DOWN_MIN_S = 300.0
+
+
+def down_run(conn: sqlite3.Connection, target: str, net_id: str, now: float) -> dict:
+    """Judge one target's `reachable` series by its current run of failures.
+
+    Returns exceeds (bool) plus the evidence an alert needs: the run itself, the probe
+    cadence, the longest EARLIER down run in the baseline, and a one-line note for the table.
+    Reuses net_memory._runs, which `availability` reported the 2026-09-08 outage through
+    correctly while the floor said nothing - so the definition of "down for how long" stays
+    in one place. An open-ended run followed by a measurement gap is not `ongoing` and cannot
+    exceed: rule 4 comes for free.
+    """
+    since = now - BASELINE_DAYS * 86400
+    rows = conn.execute(
+        "SELECT ts, value FROM sample WHERE target=? AND metric='reachable' AND net_id=? "
+        "AND ts>=? AND ts<=? ORDER BY ts", (target, net_id, since, now)).fetchall()
+    if not rows:
+        return dict(exceeds=False, run=None, last_down=None, cadence=0.0, longest_prev=None,
+                    n_rows=0, note="no reachability probes")
+    beats = [r[0] for r in conn.execute(
+        "SELECT ts FROM heartbeat WHERE net_id=? AND ts>=? AND ts<=? ORDER BY ts",
+        (net_id, since, now))]
+    bd = [b - a for a, b in zip(beats, beats[1:]) if b > a]
+    beat_cadence = sorted(bd)[len(bd) // 2] if bd else 0.0
+    diffs = [b[0] - a[0] for a, b in zip(rows, rows[1:]) if b[0] > a[0]]
+    cadence = sorted(diffs)[len(diffs) // 2] if diffs else 0.0
+
+    runs = net_memory._runs(rows, since, now, beats, beat_cadence)
+    last = runs[-1]
+    downs = [r for r in runs if r["kind"] == "down"]
+    last_down = downs[-1] if downs else None
+    prev = [r for r in downs if r is not last]
+    longest_prev = max(prev, key=lambda r: r["end"] - r["start"]) if prev else None
+
+    ongoing = last["kind"] == "down" and bool(last.get("ongoing"))
+    dur = last["end"] - last["start"]           # an ongoing run's end is `now`
+    exceeds = ongoing and last["n"] >= DOWN_MIN_PROBES and dur >= DOWN_MIN_S
+    if ongoing:
+        # Say WHICH condition holds it back. "under 3 probes / 5 min" on a run of 3 probes
+        # reads as if the probe count failed, when only the minutes did.
+        short = []
+        if last["n"] < DOWN_MIN_PROBES:
+            short.append(f"under {DOWN_MIN_PROBES} probes")
+        if dur < DOWN_MIN_S:
+            short.append(f"under {DOWN_MIN_S / 60:.0f} min")
+        note = (f"down {dur / 60:.0f} min ({last['n']} probe{'s' if last['n'] != 1 else ''})"
+                + (f" - {' and '.join(short)}" if short else ""))
+    elif last["kind"] == "gap":
+        note = "not measured recently"
+    else:
+        note = "up"
+    return dict(exceeds=exceeds, run=last if ongoing else None, last_down=last_down,
+                cadence=cadence, longest_prev=longest_prev, n_rows=len(rows), note=note)
+
+
+def render_down(kind: str, d: dict, r: dict, since: int, now: int) -> str:
+    """What a run-length alert says. The evidence is the run, not a shift and a floor."""
+    t = lambda x: time.strftime("%d %b %H:%M", time.localtime(x))       # noqa: E731
+    held_min = (now - since) / 60.0
+    head = (f"{'ALERT' if kind == 'FIRED' else 'CLEAR'}  {r['target']} / {r['metric']}   "
+            f"on net {r['net_label']!r}")
+    body = []
+    if kind == "FIRED":
+        run = d["run"]
+        body.append(f"  DOWN            : {run['n']} consecutive failures over "
+                    f"{(run['end'] - run['start']) / 60:.0f} min, since {t(run['start'])}"
+                    f"   (still down at the latest probe)")
+    else:
+        run = d["last_down"]
+        if run:
+            body.append(f"  reachable again : first success at {t(run['end'])}, after "
+                        f"{run['n']} consecutive failures over "
+                        f"{(run['end'] - run['start']) / 60:.0f} min since {t(run['start'])}")
+        else:
+            body.append("  reachable again : no failed run on record in the baseline window")
+    body.append(f"  cadence         : one probe every {d['cadence']:.0f} s")
+    body.append(f"  rule            : >= {DOWN_MIN_PROBES} failures and >= "
+                f"{DOWN_MIN_S / 60:.0f} min, then {CONFIRMATIONS} consecutive evaluations "
+                f"- confirmed over {held_min:.0f} min")
+    lp = d["longest_prev"]
+    if lp:
+        body.append(f"  longest earlier : {lp['n']} failures over "
+                    f"{(lp['end'] - lp['start']) / 60:.0f} min, from {t(lp['start'])}   "
+                    f"(last {BASELINE_DAYS:g} d on this network)")
+    else:
+        body.append(f"  longest earlier : none - no other failed run in the last "
+                    f"{BASELINE_DAYS:g} d on this network")
+    body.append("  NOTE: judged by run length, not by a noise floor. A floor built from a "
+                "history that holds earlier outages grows until 100% down is within noise.")
+    return head + "\n" + "\n".join(body)
+
+
 def evaluate(conn: sqlite3.Connection, webhook: str = "", now: Optional[float] = None,
              verbose: bool = True) -> list[dict]:
     """One evaluation pass over every signal. Returns a row per signal for display."""
@@ -368,6 +480,27 @@ def evaluate(conn: sqlite3.Connection, webhook: str = "", now: Optional[float] =
             put_state(conn, target, metric, net["net_id"],
                       dict(state="UNKNOWN", since=st["since"] if st["state"] == "UNKNOWN"
                            else inow, streak=0, last_shift=None), inow)
+            out.append(row)
+            continue
+
+        if metric == "reachable":
+            # Rule 6. No floor, no shift, no recovery_is_real: the run is the evidence and an
+            # up probe ending it is the recovery. Same step(), same k.
+            nid = net["net_id"]
+            d = down_run(conn, target, nid, now)
+            pages = d["exceeds"]
+            new_state, new_streak, event = step(st["state"], st["streak"], pages)
+            since = inow if new_state != st["state"] else st["since"]
+            new = dict(state=new_state, since=since, streak=new_streak,
+                       last_shift=-1.0 if pages else 0.0, anomaly_since=None, peak_shift=None)
+            put_state(conn, target, metric, nid, new, inow)
+            row.update(state=new_state, streak=new_streak, shift=None, note=d["note"])
+            if event:
+                r = dict(target=target, metric=metric, net_id=nid,
+                         net_label=net["label"], shift=-1.0 if event == "FIRED" else 0.0)
+                notify(conn, event, r, render_down(event, d, r, st["since"], inow), inow,
+                       webhook)
+                row["note"] = event
             out.append(row)
             continue
 

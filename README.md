@@ -77,6 +77,7 @@ diagnosis without a retry.
 | `test_net_topology.py` | validates that discovery refuses where it must, sweeps what it may, and draws the map right |
 | `test_net_report.py` | validates that the report never colours unobserved time as quiet, and flags a held alert's age |
 | `test_net_web.py` | validates the live view over a real socket: loopback only, foreign Host refused, no probe exposed, read-only, ages are of the data |
+| `test_net_downrun.py` | validates the run-length rule for `reachable`: flaps stay silent, outages fire on the third pass, a gap is not an outage, and the case the floor missed live now alerts |
 | `lab/` | a containerlab network with known answers, for grading the tools against ground truth — see `lab/README.md` |
 | `net_monitor.db` | the store (created on first run; override with `NET_MONITOR_DB`) |
 | `monitor.json` | which targets to collect, how often, optional webhook |
@@ -637,10 +638,41 @@ evaluator already decided to fire**. The evaluator can say *that* something chan
 | the threshold is the path's own noise | a fixed threshold cannot be right for a path that swings 20% *and* one stable to 2% |
 | k = 3 confirmations to fire, 3 to clear | a signal on the boundary flaps, and flapping alerts train people to ignore alerts faster than false ones do |
 | no collector heartbeats → no evaluation | a closed laptop lid is not an outage |
+| a binary signal is judged by run length, not by a noise floor | a floor built from a history that holds earlier outages grows until 100% down is within noise |
 
 The heartbeat rule needs the store to distinguish **"we did not measure"** (asleep, stopped)
 from **"we measured and nothing answered"**. The collector writes one every cycle whether or
 not any probe succeeded, so a gap is identifiable after the fact.
+
+### A binary signal cannot be judged by a floor
+
+On 2026-09-08 the hotspot lost the network from 21:50 to 23:26. Every host was down for 96
+consecutive probes, `availability` reported it in exactly those terms, and `reachable` alerted
+on **none of them**. The reason is the second rule working as designed on the wrong kind of
+signal: two earlier outages sat in the seven-day history, placebo windows landed inside them,
+the floor rose to 100%, and a total loss came out as *within noise*. `recovery_is_real` guards
+latency against a floor that grows past an undiminished shift, but reachability has no shift
+size to hold on to — it is 0 or 1 per probe.
+
+So `reachable` is now judged by its current run of failures: it exceeds when the run is still
+going at the latest probe, at least 3 probes long **and** at least 5 minutes long. Both,
+because cadence varies sixtyfold across targets. It feeds the same k = 3 state machine as
+everything else; the five-minute run is the anti-flap, k is kept for consistency. A run that
+ends in a measurement gap is not ongoing and cannot exceed, so rule four comes for free.
+
+The thresholds were read off the store, not chosen. Every down run of `reachable` in fourteen
+days, on every network: the flaps were 1 to 3 probes and all under a minute (one of 3 minutes
+on a five-minute http cadence); the outages were 15 probes or more and all 17 minutes or more.
+Nothing in between. Five minutes sits in that gap with margin on both sides. The lab's S4
+link-down lasts about 70 seconds and does not page under this rule, which is the right answer
+for a pager and is recorded rather than tuned away.
+
+Pre-registered before the code ran, and the case that failed live is in the suite: an outage
+with two earlier outages in its history, on which the placebo path reports a zero shift
+against a 100% floor and the run rule fires on the third pass. Six mutations of the rule —
+never fire, always fire, count a gap as ongoing, drop the confirmations, route through the
+old floor, mute the alert text — are each caught. `ok_2xx` and `success_rate` have the same
+weakness and are the next step, so this change is one metric wide.
 
 ### Detectable is not the same as worth telling you about
 
